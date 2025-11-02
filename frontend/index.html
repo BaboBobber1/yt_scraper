@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crypto YouTube Harvester</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Crypto YouTube Harvester</h1>
+        <p>Discover, enrich and export crypto-focused YouTube channels.</p>
+      </header>
+
+      <section class="controls">
+        <div class="field">
+          <label for="keywords">Keywords</label>
+          <textarea id="keywords" rows="4">crypto, bitcoin, ethereum, defi, altcoin, memecoin, onchain, crypto trading</textarea>
+        </div>
+        <div class="field inline">
+          <label for="perKeyword">Per keyword</label>
+          <input type="number" id="perKeyword" min="1" value="5" />
+        </div>
+        <div class="buttons">
+          <button id="discoverBtn">Discover</button>
+          <button id="enrichBtn">Enrich</button>
+          <button id="exportBtn">Export CSV</button>
+        </div>
+        <div class="status" id="status"></div>
+        <div class="progress" id="progress"></div>
+      </section>
+
+      <section class="table-section">
+        <div class="table-controls">
+          <input type="text" id="search" placeholder="Search channels" />
+          <select id="sort">
+            <option value="created_at">Newest</option>
+            <option value="title">Name</option>
+            <option value="subscribers">Subscribers</option>
+            <option value="language">Language</option>
+            <option value="last_updated">Last updated</option>
+          </select>
+        </div>
+        <table id="channelsTable">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Link</th>
+              <th>Subscribers</th>
+              <th>Language</th>
+              <th>Emails</th>
+              <th>Last updated</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="pagination">
+          <button id="prevPage">Previous</button>
+          <span id="pageInfo"></span>
+          <button id="nextPage">Next</button>
+        </div>
+      </section>
+    </div>
+    <script src="/static/script.js"></script>
+  </body>
+</html>
