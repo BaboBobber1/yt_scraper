@@ -29,18 +29,56 @@
         </div>
         <div class="status" id="status"></div>
         <div class="progress" id="progress"></div>
+        <div class="summary" id="batchSummary"></div>
+        <div class="stats" id="statsSummary"></div>
       </section>
 
       <section class="table-section">
-        <div class="table-controls">
-          <input type="text" id="search" placeholder="Search channels" />
-          <select id="sort">
-            <option value="created_at">Newest</option>
-            <option value="title">Name</option>
-            <option value="subscribers">Subscribers</option>
-            <option value="language">Language</option>
-            <option value="last_updated">Last updated</option>
-          </select>
+        <div class="filters-grid">
+          <div class="field">
+            <label for="search">Search</label>
+            <input type="text" id="search" placeholder="Free text (title, url, email)" />
+          </div>
+          <div class="field">
+            <label for="languageFilter">Languages</label>
+            <input type="text" id="languageFilter" placeholder="e.g. en,de" />
+          </div>
+          <div class="field range-field">
+            <label>Subscribers</label>
+            <div class="range-inputs">
+              <input type="number" id="minSubs" placeholder="min" min="0" />
+              <span>–</span>
+              <input type="number" id="maxSubs" placeholder="max" min="0" />
+            </div>
+          </div>
+          <div class="field status-field">
+            <span>Status</span>
+            <div class="status-options">
+              <label><input type="checkbox" value="new" /> New</label>
+              <label><input type="checkbox" value="processing" /> Processing</label>
+              <label><input type="checkbox" value="completed" /> Completed</label>
+              <label><input type="checkbox" value="error" /> Error</label>
+            </div>
+          </div>
+          <div class="field small">
+            <label for="sort">Sort</label>
+            <select id="sort">
+              <option value="created_at">Newest</option>
+              <option value="title">Name</option>
+              <option value="subscribers">Subscribers</option>
+              <option value="language">Language</option>
+              <option value="last_updated">Last updated</option>
+              <option value="status">Status</option>
+              <option value="last_status_change">Status change</option>
+            </select>
+          </div>
+          <div class="field small">
+            <label for="order">Order</label>
+            <select id="order">
+              <option value="desc">Descending</option>
+              <option value="asc">Ascending</option>
+            </select>
+          </div>
         </div>
         <table id="channelsTable">
           <thead>
@@ -50,7 +88,9 @@
               <th>Subscribers</th>
               <th>Language</th>
               <th>Emails</th>
+              <th>Status</th>
               <th>Last updated</th>
+              <th>Error</th>
             </tr>
           </thead>
           <tbody></tbody>

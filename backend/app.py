@@ -8,11 +8,12 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import database
 from .database import ensure_channel_url
-from .youtube import enrich_channel, search_channels
+from .enrichment import manager
+from .youtube import search_channels
 
 app = FastAPI(title="Crypto YouTube Harvester")
 app.add_middleware(
@@ -35,6 +36,60 @@ DEFAULT_KEYWORDS = [
     "onchain",
     "crypto trading",
 ]
+
+
+def _parse_multi(values: Optional[List[str]]) -> Optional[List[str]]:
+    if not values:
+        return None
+    cleaned = [value.strip() for value in values if value and value.strip()]
+    return cleaned or None
+
+
+def _parse_int(value: Optional[str], *, field: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field} must be an integer")
+
+
+def _collect_filters(
+    *,
+    q: Optional[str],
+    languages: Optional[List[str]],
+    statuses: Optional[List[str]],
+    min_subscribers: Optional[str],
+    max_subscribers: Optional[str],
+) -> Dict[str, Any]:
+    language_values = [value.lower() for value in _parse_multi(languages) or []] or None
+    status_values = [value.lower() for value in _parse_multi(statuses) or []] or None
+    if status_values:
+        allowed = {"new", "processing", "completed", "error"}
+        invalid = [value for value in status_values if value not in allowed]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Invalid status values: {', '.join(invalid)}")
+
+    min_subs_int = _parse_int(min_subscribers, field="min_subscribers")
+    max_subs_int = _parse_int(max_subscribers, field="max_subscribers")
+    if (
+        min_subs_int is not None
+        and max_subs_int is not None
+        and min_subs_int > max_subs_int
+    ):
+        raise HTTPException(status_code=400, detail="min_subscribers cannot exceed max_subscribers")
+
+    return {
+        "query_text": q.strip() if q else None,
+        "languages": language_values,
+        "statuses": status_values,
+        "min_subscribers": min_subs_int,
+        "max_subscribers": max_subs_int,
+    }
 
 
 @app.get("/")
@@ -83,6 +138,9 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                     "language": None,
                     "language_confidence": None,
                     "last_error": None,
+                    "status": "new",
+                    "status_reason": None,
+                    "last_status_change": now,
                 }
             )
 
@@ -98,75 +156,95 @@ def api_enrich(payload: Dict[str, Any] = Body(default={})) -> JSONResponse:
     if limit is not None:
         try:
             limit = int(limit)
-        except ValueError:
+        except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="limit must be an integer or null")
         if limit <= 0:
             raise HTTPException(status_code=400, detail="limit must be greater than zero")
 
-    pending = database.get_pending_channels(limit)
-    processed = 0
-    now = dt.datetime.utcnow().isoformat()
+    job = manager.start_job(limit)
+    return JSONResponse({"jobId": job.job_id, "total": job.total})
 
-    for channel in pending:
-        processed += 1
-        try:
-            enriched = enrich_channel(channel["url"])
-            emails = ", ".join(enriched.get("emails", [])) if enriched.get("emails") else None
-            database.update_channel_enrichment(
-                channel["channel_id"],
-                title=enriched.get("title") or channel.get("title"),
-                subscribers=enriched.get("subscribers"),
-                language=enriched.get("language"),
-                language_confidence=enriched.get("language_confidence"),
-                emails=emails,
-                last_updated=enriched.get("last_updated") or now,
-                last_attempted=now,
-                needs_enrichment=False,
-                last_error=None,
-            )
-        except Exception as exc:  # pragma: no cover - yt_dlp/network errors
-            database.update_channel_enrichment(
-                channel["channel_id"],
-                last_attempted=now,
-                needs_enrichment=True,
-                last_error=str(exc),
-            )
 
-    return JSONResponse({"processed": processed})
+@app.get("/api/enrich/stream/{job_id}")
+def api_enrich_stream(job_id: str) -> StreamingResponse:
+    try:
+        generator = manager.stream(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown enrichment job")
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
 
 
 @app.get("/api/channels")
 def api_channels(
-    search: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None),
+    language: Optional[List[str]] = Query(default=None),
+    status: Optional[List[str]] = Query(default=None),
+    min_subscribers: Optional[str] = Query(default=None),
+    max_subscribers: Optional[str] = Query(default=None),
     sort: str = Query(default="created_at"),
     order: str = Query(default="desc"),
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> JSONResponse:
+    filters = _collect_filters(
+        q=q,
+        languages=language,
+        statuses=status,
+        min_subscribers=min_subscribers,
+        max_subscribers=max_subscribers,
+    )
+
     items, total = database.get_channels(
-        search=search,
         sort=sort,
         order=order,
         limit=limit,
         offset=offset,
+        **filters,
     )
     return JSONResponse({"items": items, "total": total})
 
 
 @app.get("/api/export/csv")
-def api_export_csv() -> PlainTextResponse:
-    items, _ = database.get_channels(search=None, sort="title", order="asc", limit=10_000, offset=0)
+def api_export_csv(
+    q: Optional[str] = Query(default=None),
+    language: Optional[List[str]] = Query(default=None),
+    status: Optional[List[str]] = Query(default=None),
+    min_subscribers: Optional[str] = Query(default=None),
+    max_subscribers: Optional[str] = Query(default=None),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc"),
+) -> PlainTextResponse:
+    filters = _collect_filters(
+        q=q,
+        languages=language,
+        statuses=status,
+        min_subscribers=min_subscribers,
+        max_subscribers=max_subscribers,
+    )
+
+    items, _ = database.get_channels(
+        sort=sort,
+        order=order,
+        limit=10_000,
+        offset=0,
+        **filters,
+    )
     headers = [
         "Channel Name",
         "URL",
         "Subscribers",
         "Language",
-        "Language Confidence",
         "Emails",
+        "Status",
         "Last Updated",
+        "Last Status Change",
         "Created At",
         "Last Attempted",
-        "Last Error",
+        "Error Reason",
     ]
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -178,12 +256,13 @@ def api_export_csv() -> PlainTextResponse:
                 item.get("url") or "",
                 item.get("subscribers") or "",
                 item.get("language") or "",
-                f"{item.get('language_confidence'):.2f}" if item.get("language_confidence") is not None else "",
                 item.get("emails") or "",
+                item.get("status") or "",
                 item.get("last_updated") or "",
+                item.get("last_status_change") or "",
                 item.get("created_at") or "",
                 item.get("last_attempted") or "",
-                item.get("last_error") or "",
+                item.get("status_reason") or item.get("last_error") or "",
             ]
         )
 

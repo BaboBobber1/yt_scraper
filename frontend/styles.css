@@ -91,6 +91,18 @@ button:hover {
   color: var(--muted);
 }
 
+.summary {
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.stats {
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .table-section {
   background: var(--surface);
   border-radius: 12px;
@@ -98,19 +110,62 @@ button:hover {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
 }
 
-.table-controls {
-  display: flex;
+.filters-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 1rem;
-  margin-bottom: 1rem;
+  margin-bottom: 1.5rem;
 }
 
-.table-controls input,
-.table-controls select {
-  padding: 0.5rem;
+.filters-grid .field {
+  margin-bottom: 0;
+}
+
+.filters-grid input,
+.filters-grid select {
+  padding: 0.6rem;
   border-radius: 8px;
   border: 1px solid #30363d;
   background: #0d1117;
   color: var(--text);
+}
+
+.range-field .range-inputs {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.range-field input {
+  flex: 1;
+}
+
+.range-field span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.status-field > span {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-weight: 600;
+}
+
+.status-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.status-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 500;
+}
+
+.status-options input {
+  width: auto;
 }
 
 #channelsTable {
@@ -136,6 +191,41 @@ button:hover {
   text-decoration: none;
 }
 
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.status-badge.neutral {
+  background: #30363d;
+  color: var(--text);
+}
+
+.status-badge.processing {
+  background: #1f6feb;
+  color: #ffffff;
+}
+
+.status-badge.success {
+  background: #2ea043;
+  color: #0d1117;
+}
+
+.status-badge.error {
+  background: #f85149;
+  color: #0d1117;
+}
+
+.error-text {
+  color: #f85149;
+}
+
 .pagination {
   display: flex;
   justify-content: space-between;
@@ -148,8 +238,8 @@ button:hover {
     padding: 1rem;
   }
 
-  .table-controls {
-    flex-direction: column;
+  .filters-grid {
+    grid-template-columns: 1fr;
   }
 
   .pagination {
