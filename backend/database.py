@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DB_PATH = Path("data") / "channels.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -49,10 +49,26 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 last_attempted TEXT,
                 needs_enrichment INTEGER NOT NULL DEFAULT 1,
-                last_error TEXT
+                last_error TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                status_reason TEXT,
+                last_status_change TEXT
             )
             """
         )
+
+        _ensure_column(cursor, "channels", "status", "TEXT NOT NULL DEFAULT 'new'")
+        _ensure_column(cursor, "channels", "status_reason", "TEXT")
+        _ensure_column(cursor, "channels", "last_status_change", "TEXT")
+        # Legacy field cleanup: drop needs_enrichment if present but unused by new status model.
+        # We keep the column to avoid destructive migrations but ensure defaults align.
+
+
+def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cursor.fetchall()}
+    if column not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def insert_channel(channel: Dict[str, Any]) -> bool:
@@ -64,8 +80,9 @@ def insert_channel(channel: Dict[str, Any]) -> bool:
                 INSERT INTO channels (
                     channel_id, title, url, subscribers, language,
                     language_confidence, emails, last_updated, created_at,
-                    last_attempted, needs_enrichment, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_attempted, needs_enrichment, last_error,
+                    status, status_reason, last_status_change
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel["channel_id"],
@@ -80,6 +97,9 @@ def insert_channel(channel: Dict[str, Any]) -> bool:
                     channel.get("last_attempted"),
                     1 if channel.get("needs_enrichment", True) else 0,
                     channel.get("last_error"),
+                    channel.get("status", "new"),
+                    channel.get("status_reason"),
+                    channel.get("last_status_change"),
                 ),
             )
             return True
@@ -107,6 +127,9 @@ def update_channel_enrichment(
     last_attempted: Optional[str] = None,
     needs_enrichment: Optional[bool] = None,
     last_error: Optional[str] = None,
+    status: Optional[str] = None,
+    status_reason: Optional[str] = None,
+    last_status_change: Optional[str] = None,
 ) -> None:
     fields: List[str] = []
     values: List[Any] = []
@@ -133,6 +156,12 @@ def update_channel_enrichment(
         add("needs_enrichment", 1 if needs_enrichment else 0)
     if last_error is not None:
         add("last_error", last_error)
+    if status is not None:
+        add("status", status)
+    if status_reason is not None:
+        add("status_reason", status_reason)
+    if last_status_change is not None:
+        add("last_status_change", last_status_change)
 
     if not fields:
         return
@@ -149,20 +178,34 @@ def update_channel_enrichment(
 def get_channel_totals() -> Dict[str, int]:
     with get_cursor() as cursor:
         cursor.execute(
-            "SELECT COUNT(*) as total, SUM(CASE WHEN needs_enrichment = 1 THEN 1 ELSE 0 END) AS pending FROM channels"
+            """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) AS new_count,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing_count,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_count,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM channels
+            """
         )
         row = cursor.fetchone()
         total = row["total"] if row and row["total"] is not None else 0
-        pending = row["pending"] if row and row["pending"] is not None else 0
         return {
             "total": total,
-            "pending_enrichment": pending,
+            "new": row["new_count"] if row and row["new_count"] is not None else 0,
+            "processing": row["processing_count"] if row and row["processing_count"] is not None else 0,
+            "completed": row["completed_count"] if row and row["completed_count"] is not None else 0,
+            "error": row["error_count"] if row and row["error_count"] is not None else 0,
         }
 
 
 def get_channels(
     *,
-    search: Optional[str],
+    query_text: Optional[str],
+    languages: Optional[Sequence[str]],
+    statuses: Optional[Sequence[str]],
+    min_subscribers: Optional[int],
+    max_subscribers: Optional[int],
     sort: str,
     order: str,
     limit: int,
@@ -174,18 +217,44 @@ def get_channels(
         "language": "language",
         "last_updated": "last_updated",
         "created_at": "created_at",
+        "status": "status",
+        "last_status_change": "last_status_change",
     }
     sort_column = valid_sorts.get(sort, "created_at")
     order_direction = "DESC" if order.lower() == "desc" else "ASC"
 
+    clauses: List[str] = []
     params: List[Any] = []
-    where_clause = ""
-    if search:
-        where_clause = "WHERE title LIKE ? OR url LIKE ? OR emails LIKE ?"
-        term = f"%{search}%"
+
+    if query_text:
+        clauses.append("(title LIKE ? OR url LIKE ? OR emails LIKE ?)")
+        term = f"%{query_text}%"
         params.extend([term, term, term])
 
-    query = f"SELECT * FROM channels {where_clause} ORDER BY {sort_column} {order_direction} LIMIT ? OFFSET ?"
+    if languages:
+        placeholders = ",".join("?" for _ in languages)
+        clauses.append(f"language IN ({placeholders})")
+        params.extend(languages)
+
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(statuses)
+
+    if min_subscribers is not None:
+        clauses.append("(subscribers IS NOT NULL AND subscribers >= ?)")
+        params.append(min_subscribers)
+
+    if max_subscribers is not None:
+        clauses.append("(subscribers IS NOT NULL AND subscribers <= ?)")
+        params.append(max_subscribers)
+
+    where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    query = (
+        f"SELECT * FROM channels {where_clause} "
+        f"ORDER BY {sort_column} {order_direction} LIMIT ? OFFSET ?"
+    )
     params.extend([limit, offset])
 
     with get_cursor() as cursor:
@@ -194,9 +263,10 @@ def get_channels(
 
         cursor.execute(
             f"SELECT COUNT(*) FROM channels {where_clause}",
-            params[:-2] if search else [],
+            params[:-2],
         )
-        total = cursor.fetchone()[0]
+        total_row = cursor.fetchone()
+        total = total_row[0] if total_row else 0
 
     items = [dict(row) for row in rows]
     return items, total
@@ -206,12 +276,27 @@ def get_pending_channels(limit: Optional[int]) -> List[Dict[str, Any]]:
     limit_clause = "LIMIT ?" if limit is not None else ""
     params: Tuple[Any, ...] = (limit,) if limit is not None else tuple()
     query = (
-        "SELECT * FROM channels WHERE needs_enrichment = 1 ORDER BY last_attempted IS NULL DESC, last_attempted ASC "
+        "SELECT * FROM channels WHERE status IN ('new', 'error') "
+        "ORDER BY last_attempted IS NULL DESC, last_attempted ASC "
         + limit_clause
     )
     with get_cursor() as cursor:
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
+
+
+def set_channel_status(channel_id: str, status: str, *, reason: Optional[str], timestamp: Optional[str]) -> None:
+    last_error_value = reason
+    if reason is None and status in {"new", "processing"}:
+        last_error_value = ""
+    update_channel_enrichment(
+        channel_id,
+        status=status,
+        status_reason=reason,
+        last_status_change=timestamp,
+        needs_enrichment=None,
+        last_error=last_error_value,
+    )
 
 
 def ensure_channel_url(channel_id: str, url: Optional[str]) -> str:
