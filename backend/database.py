@@ -366,6 +366,67 @@ def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[
         return targets
 
 
+def archive_or_create_channel(channel_id: str, timestamp: str) -> Tuple[bool, bool]:
+    """Archive an existing channel or create an archived placeholder.
+
+    Returns a tuple ``(updated_existing, created_new)`` indicating whether the
+    channel already existed in the database or a new placeholder row was
+    created.
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(
+            "SELECT channel_id FROM channels WHERE channel_id = ?",
+            (channel_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            cursor.execute(
+                """
+                UPDATE channels
+                SET archived = 1,
+                    archived_at = ?,
+                    needs_enrichment = 0
+                WHERE channel_id = ?
+                """,
+                (timestamp, channel_id),
+            )
+            return True, False
+
+        url = ensure_channel_url(channel_id, None)
+        cursor.execute(
+            """
+            INSERT INTO channels (
+                channel_id, title, url, subscribers, language,
+                language_confidence, emails, last_updated, created_at,
+                last_attempted, needs_enrichment, last_error,
+                status, status_reason, last_status_change,
+                archived, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel_id,
+                None,
+                url,
+                None,
+                None,
+                None,
+                None,
+                None,
+                timestamp,
+                None,
+                0,
+                None,
+                "new",
+                None,
+                None,
+                1,
+                timestamp,
+            ),
+        )
+        return False, True
+
+
 def set_channel_status(channel_id: str, status: str, *, reason: Optional[str], timestamp: Optional[str]) -> None:
     last_error_value = reason
     if reason is None and status in {"new", "processing"}:

@@ -96,6 +96,71 @@ button:disabled {
   background: #21262d;
 }
 
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  z-index: 1000;
+}
+
+.modal.open {
+  display: flex;
+}
+
+.modal-content {
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 2rem;
+  position: relative;
+  max-width: 480px;
+  width: 100%;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+
+.modal-close {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  background: transparent;
+  color: var(--text);
+  font-size: 1.5rem;
+  line-height: 1;
+  padding: 0.25rem 0.5rem;
+}
+
+.modal-close:hover {
+  background: rgba(63, 185, 80, 0.12);
+}
+
+.modal-actions {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.modal-status {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+}
+
+.modal-status[data-type='error'] {
+  color: #f85149;
+}
+
+.modal-status[data-type='success'] {
+  color: #3fb950;
+}
+
+.modal-note {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-top: 0.4rem;
+}
+
 .status {
   margin-top: 1rem;
   font-weight: 500;

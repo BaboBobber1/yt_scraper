@@ -27,6 +27,7 @@
           <button id="enrichBtn">Enrich</button>
           <button id="enrichEmailBtn">Enrich (Email-only)</button>
           <button id="exportBtn">Export CSV</button>
+          <button id="importBlacklistBtn" class="ghost-button">Import blacklist (CSV)</button>
         </div>
         <div class="status" id="status"></div>
         <div class="progress" id="progress"></div>
@@ -116,6 +117,24 @@
           <button id="nextPage">Next</button>
         </div>
       </section>
+    </div>
+    <div class="modal" id="blacklistModal" aria-hidden="true">
+      <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="blacklistTitle">
+        <button type="button" class="modal-close" id="blacklistCloseBtn" aria-label="Close">×</button>
+        <h2 id="blacklistTitle">Import blacklist</h2>
+        <form id="blacklistForm">
+          <div class="field">
+            <label for="blacklistFile">CSV file</label>
+            <input type="file" id="blacklistFile" accept=".csv,text/csv" required />
+            <p class="modal-note">Accepted columns: <code>channel_id</code> or <code>url</code>. Additional columns are ignored.</p>
+          </div>
+          <div class="modal-actions">
+            <button type="submit" id="blacklistSubmitBtn">Import</button>
+            <button type="button" class="ghost-button" id="blacklistCancelBtn">Cancel</button>
+          </div>
+        </form>
+        <div class="modal-status" id="blacklistSummary"></div>
+      </div>
     </div>
     <script src="/static/script.js"></script>
   </body>

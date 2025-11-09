@@ -4,9 +4,10 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Set
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -43,6 +44,24 @@ def _parse_multi(values: Optional[List[str]]) -> Optional[List[str]]:
         return None
     cleaned = [value.strip() for value in values if value and value.strip()]
     return cleaned or None
+
+
+CHANNEL_ID_PATTERN = re.compile(r"(UC[\w-]{22})", re.IGNORECASE)
+
+
+def _extract_channel_id(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    cleaned = cleaned.split("?")[0].rstrip("/")
+    match = CHANNEL_ID_PATTERN.search(cleaned)
+    if match:
+        return match.group(1).upper()
+    if cleaned.upper().startswith("UC") and len(cleaned) == 24 and CHANNEL_ID_PATTERN.match(cleaned):
+        return cleaned.upper()
+    return None
 
 
 def _parse_int(value: Optional[str], *, field: str) -> Optional[int]:
@@ -154,6 +173,60 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     totals = database.get_channel_totals()
 
     return JSONResponse({"found": inserted, "uniqueTotal": totals["total"]})
+
+
+@app.post("/api/blacklist/import")
+async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing CSV file")
+
+    try:
+        raw_bytes = await file.read()
+    except Exception as exc:  # pragma: no cover - I/O errors are rare
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {exc}") from exc
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    try:
+        decoded = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded") from exc
+
+    reader = csv.DictReader(io.StringIO(decoded))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV is missing headers")
+
+    normalized_headers = {header.strip().lower() for header in reader.fieldnames if header}
+    if not {"channel_id", "url"} & normalized_headers:
+        raise HTTPException(status_code=400, detail="CSV must include a 'channel_id' or 'url' column")
+
+    timestamp = dt.datetime.utcnow().isoformat()
+    seen: Set[str] = set()
+    summary = {"imported": 0, "updated": 0, "created": 0, "skipped": 0}
+
+    for row in reader:
+        if not row:
+            summary["skipped"] += 1
+            continue
+        normalized = {str(key).strip().lower(): (value or "").strip() for key, value in row.items() if key}
+        candidate = normalized.get("channel_id") or normalized.get("url")
+        channel_id = _extract_channel_id(candidate)
+        if not channel_id or channel_id in seen:
+            summary["skipped"] += 1
+            continue
+
+        seen.add(channel_id)
+        summary["imported"] += 1
+        updated, created = database.archive_or_create_channel(channel_id, timestamp)
+        if created:
+            summary["created"] += 1
+        elif updated:
+            summary["updated"] += 1
+        else:
+            summary["skipped"] += 1
+
+    return JSONResponse(summary)
 
 
 @app.post("/api/enrich")
