@@ -213,7 +213,7 @@ def _build_channel_filters(
     statuses: Optional[Sequence[str]],
     min_subscribers: Optional[int],
     max_subscribers: Optional[int],
-    emails_only: bool,
+    emails_only: bool = False,
     include_archived: bool,
 ) -> Tuple[str, List[Any]]:
     clauses: List[str] = []
@@ -263,7 +263,7 @@ def get_channels(
     order: str,
     limit: int,
     offset: int,
-    emails_only: bool,
+    emails_only: bool = False,
     include_archived: bool,
 ) -> Tuple[List[Dict[str, Any]], int]:
     valid_sorts = {

@@ -284,6 +284,8 @@ def api_channels(
         emails_only=emails_only,
         include_archived=include_archived,
     )
+    filters.pop("emails_only", None)
+    filters.pop("include_archived", None)
 
     items, total = database.get_channels(
         sort=sort,
@@ -344,6 +346,8 @@ def api_archive_bulk(
             emails_only=emails_only,
             include_archived=include_archived,
         )
+        filters.pop("emails_only", None)
+        filters.pop("include_archived", None)
         items, _ = database.get_channels(
             sort=sort,
             order=order,
@@ -380,6 +384,8 @@ def api_export_csv(
         emails_only=emails_only,
         include_archived=include_archived,
     )
+    filters.pop("emails_only", None)
+    filters.pop("include_archived", None)
 
     items, _ = database.get_channels(
         sort=sort,
