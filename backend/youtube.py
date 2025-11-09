@@ -1,6 +1,7 @@
 """Utilities for interacting with YouTube without requiring official APIs."""
 from __future__ import annotations
 
+import datetime as dt
 import html
 import json
 import re
@@ -186,9 +187,9 @@ def extract_emails(texts: Iterable[str]) -> List[str]:
     return unique
 
 
-def _fetch_rss(channel_id: str) -> Tuple[str, Optional[str], Dict[str, Optional[str]]]:
+def _fetch_rss(channel_id: str, timeout: int = 8) -> Tuple[str, Optional[str], Dict[str, Optional[str]]]:
     RATE_LIMITER.wait()
-    response = SESSION.get(RSS_TEMPLATE.format(channel_id=channel_id), timeout=8)
+    response = SESSION.get(RSS_TEMPLATE.format(channel_id=channel_id), timeout=timeout)
     if response.status_code == 404:
         raise EnrichmentError("Channel feed not available")
     response.raise_for_status()
@@ -252,12 +253,12 @@ def _find_first(node: object, key: str) -> Optional[Dict]:
     return None
 
 
-def _fetch_watch_details(video_id: str) -> Dict[str, Optional[str]]:
+def _fetch_watch_details(video_id: str, timeout: int = 10) -> Dict[str, Optional[str]]:
     RATE_LIMITER.wait()
     response = SESSION.get(
         "https://www.youtube.com/watch",
         params={"v": video_id},
-        timeout=10,
+        timeout=timeout,
     )
     if response.status_code == 429:
         raise EnrichmentError("Rate limited by YouTube")
@@ -333,3 +334,88 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
         "emails": unique_emails,
         "last_updated": watch.get("upload_date") or video.get("timestamp"),
     }
+
+
+def _resolve_about_url(channel: Dict[str, Optional[str]]) -> str:
+    url = channel.get("url") or ""
+    if url:
+        base = url.split("?")[0].rstrip("/")
+        if base.endswith("/about"):
+            return base
+        return f"{base}/about"
+    channel_id = channel.get("channel_id")
+    if not channel_id:
+        raise EnrichmentError("Missing channel id")
+    return f"https://www.youtube.com/channel/{channel_id}/about"
+
+
+def _fetch_about_emails(channel: Dict[str, Optional[str]], timeout: int = 5) -> List[str]:
+    about_url = _resolve_about_url(channel)
+    RATE_LIMITER.wait()
+    try:
+        response = SESSION.get(about_url, timeout=timeout)
+    except requests.RequestException as exc:  # pragma: no cover - network errors
+        raise EnrichmentError(f"Failed to load channel about page: {exc}")
+    if response.status_code == 404:
+        return []
+    response.raise_for_status()
+    return extract_emails([html.unescape(response.text)])
+
+
+def _fetch_latest_video_metadata(channel_id: str) -> Optional[Dict[str, Optional[str]]]:
+    try:
+        _, feed_description, video = _fetch_rss(channel_id, timeout=5)
+    except EnrichmentError:
+        return None
+    except requests.RequestException as exc:  # pragma: no cover - network errors
+        raise EnrichmentError(f"Failed to load channel feed: {exc}")
+
+    try:
+        watch = _fetch_watch_details(video["video_id"], timeout=6)
+    except EnrichmentError:
+        watch = {}
+    except requests.RequestException as exc:  # pragma: no cover - network errors
+        raise EnrichmentError(f"Failed to load latest video: {exc}")
+
+    description = watch.get("description") or video.get("description") or ""
+    return {
+        "title": video.get("title", ""),
+        "description": description,
+        "feed_description": feed_description or "",
+        "timestamp": watch.get("upload_date") or video.get("timestamp"),
+    }
+
+
+def enrich_channel_email_only(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    channel_id = channel.get("channel_id")
+    if not channel_id:
+        raise EnrichmentError("Missing channel id")
+
+    emails: List[str] = []
+
+    about_emails = _fetch_about_emails(channel)
+    if about_emails:
+        emails.extend(about_emails)
+
+    video = _fetch_latest_video_metadata(channel_id)
+    last_updated = None
+    if video:
+        candidate_texts = [video.get("title", ""), video.get("description", ""), video.get("feed_description", "")]
+        emails.extend(extract_emails(candidate_texts))
+        last_updated = video.get("timestamp")
+
+    unique_emails: List[str] = []
+    seen = set()
+    for email in emails:
+        lower = email.lower()
+        if lower in seen:
+            continue
+        unique_emails.append(email)
+        seen.add(lower)
+        if len(unique_emails) >= 5:
+            break
+
+    if not last_updated:
+        last_updated = dt.datetime.utcnow().isoformat()
+
+    return {"emails": unique_emails, "last_updated": last_updated}
