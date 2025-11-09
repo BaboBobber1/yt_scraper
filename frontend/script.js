@@ -13,6 +13,8 @@ const state = {
   eventSource: null,
   currentJobId: null,
   progress: { total: 0, completed: 0, errors: 0, pending: 0, durationSeconds: 0 },
+  emailsOnly: false,
+  includeArchived: false,
 };
 
 const statusEl = document.getElementById('status');
@@ -21,6 +23,10 @@ const batchSummaryEl = document.getElementById('batchSummary');
 const statsSummaryEl = document.getElementById('statsSummary');
 const tableBody = document.querySelector('#channelsTable tbody');
 const pageInfo = document.getElementById('pageInfo');
+const archiveAllBtn = document.getElementById('archiveAllBtn');
+const emailsToggle = document.getElementById('emailsToggle');
+const hideArchivedToggle = document.getElementById('hideArchivedToggle');
+const archivingInFlight = new Set();
 
 async function fetchJSON(url, options = {}) {
   const response = await fetch(url, {
@@ -67,6 +73,8 @@ function buildQueryParams({ includePagination = true } = {}) {
   if (state.maxSubscribers) {
     params.set('max_subscribers', state.maxSubscribers);
   }
+  params.set('emails_only', state.emailsOnly ? 'true' : 'false');
+  params.set('include_archived', state.includeArchived ? 'true' : 'false');
   return params;
 }
 
@@ -136,6 +144,7 @@ function statusLabel(status) {
 
 function applyRowData(row, item) {
   row.innerHTML = '';
+  row.dataset.channelId = item.channel_id;
   const cells = [
     item.title || 'Unknown',
     item.url,
@@ -147,8 +156,18 @@ function applyRowData(row, item) {
     item.status_reason || item.last_error || '',
   ];
 
+  row.classList.toggle('archived-row', Boolean(item.archived));
+
   const nameCell = document.createElement('td');
-  nameCell.textContent = cells[0];
+  const nameText = document.createElement('span');
+  nameText.textContent = cells[0];
+  nameCell.appendChild(nameText);
+  if (item.archived) {
+    const archivedBadge = document.createElement('span');
+    archivedBadge.className = 'archived-badge';
+    archivedBadge.textContent = 'Archived';
+    nameCell.appendChild(archivedBadge);
+  }
   row.appendChild(nameCell);
 
   const linkCell = document.createElement('td');
@@ -191,6 +210,20 @@ function applyRowData(row, item) {
     errorCell.textContent = cells[7];
   }
   row.appendChild(errorCell);
+
+  const actionsCell = document.createElement('td');
+  actionsCell.classList.add('actions-cell');
+  const archiveBtn = document.createElement('button');
+  archiveBtn.className = 'ghost-button archive-btn';
+  if (item.archived) {
+    archiveBtn.textContent = 'Archived';
+    archiveBtn.disabled = true;
+  } else {
+    archiveBtn.textContent = 'Archive';
+    archiveBtn.addEventListener('click', () => handleArchiveChannel(item.channel_id));
+  }
+  actionsCell.appendChild(archiveBtn);
+  row.appendChild(actionsCell);
 }
 
 function renderTable(items) {
@@ -200,10 +233,11 @@ function renderTable(items) {
   if (items.length === 0) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
-    cell.colSpan = 8;
+    cell.colSpan = 9;
     cell.textContent = 'No channels yet. Try discovering some keywords.';
     row.appendChild(cell);
     tableBody.appendChild(row);
+    updateArchiveControls();
     return;
   }
 
@@ -215,12 +249,21 @@ function renderTable(items) {
     state.rows.set(item.channel_id, { element: row, item: storedItem });
     tableBody.appendChild(row);
   });
+  updateArchiveControls();
 }
 
 function updatePagination() {
   const currentPage = Math.floor(state.offset / state.limit) + 1;
   const totalPages = Math.max(1, Math.ceil(state.total / state.limit));
   pageInfo.textContent = `Page ${currentPage} of ${totalPages} (${state.total} channels)`;
+}
+
+function updateArchiveControls() {
+  if (!archiveAllBtn) {
+    return;
+  }
+  const hasArchivable = Array.from(state.rows.values()).some(({ item }) => !item.archived);
+  archiveAllBtn.disabled = !hasArchivable;
 }
 
 function updateChannelRowFromStream(update) {
@@ -256,7 +299,122 @@ function updateChannelRowFromStream(update) {
   if ('statusReason' in update) {
     item.status_reason = update.statusReason || '';
   }
+  if (typeof update.archived === 'boolean') {
+    item.archived = update.archived;
+  }
   applyRowData(element, item);
+  state.rows.set(update.channelId, { element, item });
+  updateArchiveControls();
+}
+
+function markChannelArchived(channelId, archivedAt) {
+  const entry = state.rows.get(channelId);
+  if (!entry) {
+    return { removed: false };
+  }
+  const { item, element } = entry;
+  item.archived = true;
+  item.archived_at = archivedAt;
+  let removed = false;
+  if (!state.includeArchived) {
+    element.remove();
+    state.rows.delete(channelId);
+    state.total = Math.max(0, state.total - 1);
+    removed = true;
+    if (state.rows.size === 0 && state.total === 0) {
+      tableBody.innerHTML = '';
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 9;
+      cell.textContent = 'No channels match the current filters.';
+      row.appendChild(cell);
+      tableBody.appendChild(row);
+    }
+  } else {
+    applyRowData(element, item);
+    state.rows.set(channelId, { element, item });
+  }
+  updatePagination();
+  updateArchiveControls();
+  return { removed };
+}
+
+async function handleArchiveChannel(channelId) {
+  if (archivingInFlight.has(channelId)) {
+    return;
+  }
+  const entry = state.rows.get(channelId);
+  if (!entry || entry.item.archived) {
+    return;
+  }
+
+  const button = entry.element.querySelector('.archive-btn');
+  archivingInFlight.add(channelId);
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Archiving…';
+  }
+
+  try {
+    const response = await fetchJSON(`/api/channels/${channelId}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    const archivedAt = response?.archivedAt || new Date().toISOString();
+    const { removed } = markChannelArchived(channelId, archivedAt);
+    setStatus('Channel archived.', 'success');
+    if (removed && state.rows.size === 0 && state.total > 0) {
+      await loadChannels();
+    }
+    await pollStats();
+  } catch (error) {
+    console.error(error);
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Archive';
+    }
+    setStatus(`Failed to archive channel: ${error.message}`, 'error');
+  } finally {
+    archivingInFlight.delete(channelId);
+  }
+}
+
+async function handleArchiveBulk() {
+  if (!archiveAllBtn) {
+    return;
+  }
+  const candidates = Array.from(state.rows.values())
+    .map(({ item }) => item)
+    .filter((item) => !item.archived)
+    .map((item) => item.channel_id);
+  if (candidates.length === 0) {
+    return;
+  }
+
+  archiveAllBtn.disabled = true;
+  try {
+    const params = buildQueryParams();
+    const response = await fetchJSON(`/api/channels/archive_bulk?${params.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({ channel_ids: candidates }),
+    });
+    const archivedIds = Array.isArray(response?.archivedIds) ? response.archivedIds : candidates;
+    const archivedAt = response?.archivedAt || new Date().toISOString();
+    archivedIds.forEach((id) => {
+      markChannelArchived(id, archivedAt);
+    });
+    const totalArchived = archivedIds.length;
+    setStatus(`Archived ${totalArchived} channel${totalArchived === 1 ? '' : 's'}.`, 'success');
+    if (!state.includeArchived && state.rows.size === 0 && state.total > 0) {
+      await loadChannels();
+    }
+    await pollStats();
+  } catch (error) {
+    console.error(error);
+    setStatus(`Failed to archive channels: ${error.message}`, 'error');
+  } finally {
+    updateArchiveControls();
+  }
 }
 
 function updateProgressText() {
@@ -457,6 +615,9 @@ function initEvents() {
   document.getElementById('discoverBtn').addEventListener('click', handleDiscover);
   document.getElementById('enrichBtn').addEventListener('click', handleEnrich);
   document.getElementById('exportBtn').addEventListener('click', handleExport);
+  if (archiveAllBtn) {
+    archiveAllBtn.addEventListener('click', handleArchiveBulk);
+  }
 
   document.getElementById('prevPage').addEventListener('click', () => {
     state.offset = Math.max(0, state.offset - state.limit);
@@ -524,10 +685,32 @@ function initEvents() {
       loadChannels();
     });
   });
+
+  if (emailsToggle) {
+    emailsToggle.addEventListener('change', (event) => {
+      state.emailsOnly = event.target.checked;
+      state.offset = 0;
+      loadChannels();
+    });
+  }
+
+  if (hideArchivedToggle) {
+    hideArchivedToggle.addEventListener('change', (event) => {
+      state.includeArchived = !event.target.checked;
+      state.offset = 0;
+      loadChannels();
+    });
+  }
 }
 
 async function init() {
   initEvents();
+  if (emailsToggle) {
+    emailsToggle.checked = state.emailsOnly;
+  }
+  if (hideArchivedToggle) {
+    hideArchivedToggle.checked = !state.includeArchived;
+  }
   await loadChannels();
   await pollStats();
   statsInterval = setInterval(pollStats, 5000);
