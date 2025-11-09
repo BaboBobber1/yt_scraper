@@ -31,6 +31,14 @@ const hideArchivedToggle = document.getElementById('hideArchivedToggle');
 const enrichBtn = document.getElementById('enrichBtn');
 const enrichEmailBtn = document.getElementById('enrichEmailBtn');
 const archivingInFlight = new Set();
+const importBlacklistBtn = document.getElementById('importBlacklistBtn');
+const blacklistModal = document.getElementById('blacklistModal');
+const blacklistForm = document.getElementById('blacklistForm');
+const blacklistFileInput = document.getElementById('blacklistFile');
+const blacklistSummary = document.getElementById('blacklistSummary');
+const blacklistSubmitBtn = document.getElementById('blacklistSubmitBtn');
+const blacklistCloseBtn = document.getElementById('blacklistCloseBtn');
+const blacklistCancelBtn = document.getElementById('blacklistCancelBtn');
 
 async function fetchJSON(url, options = {}) {
   const response = await fetch(url, {
@@ -117,6 +125,111 @@ function setBatchSummary(message) {
 
 function setStatsSummary(message) {
   statsSummaryEl.textContent = message;
+}
+
+function resetBlacklistModal() {
+  if (blacklistForm) {
+    blacklistForm.reset();
+  }
+  if (blacklistSummary) {
+    blacklistSummary.textContent = '';
+    blacklistSummary.dataset.type = '';
+  }
+  if (blacklistSubmitBtn) {
+    blacklistSubmitBtn.disabled = false;
+  }
+  if (blacklistCancelBtn) {
+    blacklistCancelBtn.disabled = false;
+  }
+}
+
+function openBlacklistModal() {
+  if (!blacklistModal) {
+    return;
+  }
+  resetBlacklistModal();
+  blacklistModal.classList.add('open');
+  blacklistModal.setAttribute('aria-hidden', 'false');
+}
+
+function closeBlacklistModal() {
+  if (!blacklistModal) {
+    return;
+  }
+  blacklistModal.classList.remove('open');
+  blacklistModal.setAttribute('aria-hidden', 'true');
+}
+
+async function handleBlacklistImport(event) {
+  event.preventDefault();
+  if (!blacklistFileInput || !blacklistFileInput.files || blacklistFileInput.files.length === 0) {
+    if (blacklistSummary) {
+      blacklistSummary.textContent = 'Please choose a CSV file to import.';
+      blacklistSummary.dataset.type = 'error';
+    }
+    return;
+  }
+
+  const file = blacklistFileInput.files[0];
+  const formData = new FormData();
+  formData.append('file', file);
+
+  if (blacklistSummary) {
+    blacklistSummary.textContent = 'Importing blacklist…';
+    blacklistSummary.dataset.type = '';
+  }
+  if (blacklistSubmitBtn) {
+    blacklistSubmitBtn.disabled = true;
+  }
+  if (blacklistCancelBtn) {
+    blacklistCancelBtn.disabled = true;
+  }
+
+  try {
+    const response = await fetch('/api/blacklist/import', {
+      method: 'POST',
+      body: formData,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || 'Import failed');
+    }
+    let result = {};
+    try {
+      result = await response.json();
+    } catch (error) {
+      console.warn('Failed to parse blacklist import response as JSON', error);
+    }
+    const imported = Number(result.imported) || 0;
+    const updated = Number(result.updated) || 0;
+    const created = Number(result.created) || 0;
+    const skipped = Number(result.skipped) || 0;
+    const summaryText = `Imported ${imported} channel${imported === 1 ? '' : 's'} (updated: ${updated}, created: ${created}${skipped ? `, skipped: ${skipped}` : ''}).`;
+    if (blacklistSummary) {
+      blacklistSummary.textContent = summaryText;
+      blacklistSummary.dataset.type = 'success';
+    }
+    setStatus(summaryText, 'success');
+    if (blacklistFileInput) {
+      blacklistFileInput.value = '';
+    }
+    await loadChannels();
+    await pollStats();
+  } catch (error) {
+    console.error('Blacklist import failed', error);
+    if (blacklistSummary) {
+      blacklistSummary.textContent = `Import failed: ${error.message}`;
+      blacklistSummary.dataset.type = 'error';
+    }
+    setStatus(`Blacklist import failed: ${error.message}`, 'error');
+  } finally {
+    if (blacklistSubmitBtn) {
+      blacklistSubmitBtn.disabled = false;
+    }
+    if (blacklistCancelBtn) {
+      blacklistCancelBtn.disabled = false;
+    }
+  }
 }
 
 function formatLanguage(item) {
@@ -683,6 +796,34 @@ function initEvents() {
   if (archiveAllBtn) {
     archiveAllBtn.addEventListener('click', handleArchiveBulk);
   }
+  if (importBlacklistBtn) {
+    importBlacklistBtn.addEventListener('click', openBlacklistModal);
+  }
+  if (blacklistCloseBtn) {
+    blacklistCloseBtn.addEventListener('click', () => {
+      closeBlacklistModal();
+    });
+  }
+  if (blacklistCancelBtn) {
+    blacklistCancelBtn.addEventListener('click', () => {
+      closeBlacklistModal();
+    });
+  }
+  if (blacklistModal) {
+    blacklistModal.addEventListener('click', (event) => {
+      if (event.target === blacklistModal) {
+        closeBlacklistModal();
+      }
+    });
+  }
+  if (blacklistForm) {
+    blacklistForm.addEventListener('submit', handleBlacklistImport);
+  }
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && blacklistModal?.classList.contains('open')) {
+      closeBlacklistModal();
+    }
+  });
 
   document.getElementById('prevPage').addEventListener('click', () => {
     state.offset = Math.max(0, state.offset - state.limit);
