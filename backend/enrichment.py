@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from . import database
-from .youtube import EnrichmentError, enrich_channel
+from .youtube import EnrichmentError, enrich_channel, enrich_channel_email_only
 
 
 @dataclass
@@ -21,6 +21,7 @@ class EnrichmentJob:
 
     job_id: str
     channels: List[Dict]
+    mode: str = "full"
     started_at: float = field(default_factory=time.monotonic)
     completed: int = 0
     errors: int = 0
@@ -60,6 +61,7 @@ class EnrichmentJob:
             "errors": self.errors,
             "pending": pending,
             "durationSeconds": round(elapsed, 2),
+            "mode": self.mode,
         }
 
 
@@ -71,10 +73,15 @@ class EnrichmentManager:
         self._jobs: Dict[str, EnrichmentJob] = {}
         self._lock = threading.Lock()
 
-    def start_job(self, limit: Optional[int]) -> EnrichmentJob:
-        channels = database.get_pending_channels(limit)
+    def start_job(self, limit: Optional[int], mode: str = "full") -> EnrichmentJob:
+        if mode not in {"full", "email_only"}:
+            raise ValueError(f"Unsupported enrichment mode: {mode}")
+        if mode == "email_only":
+            channels = database.get_channels_for_email_enrichment(limit)
+        else:
+            channels = database.get_pending_channels(limit)
         job_id = str(uuid.uuid4())
-        job = EnrichmentJob(job_id=job_id, channels=channels)
+        job = EnrichmentJob(job_id=job_id, channels=channels, mode=mode)
         with self._lock:
             self._jobs[job_id] = job
 
@@ -117,6 +124,12 @@ class EnrichmentManager:
         return event_stream()
 
     def _process_channel(self, job: EnrichmentJob, channel: Dict) -> None:
+        if job.mode == "email_only":
+            self._process_channel_email_only(job, channel)
+        else:
+            self._process_channel_full(job, channel)
+
+    def _process_channel_full(self, job: EnrichmentJob, channel: Dict) -> None:
         channel_id = channel["channel_id"]
         now = dt.datetime.utcnow().isoformat()
         database.update_channel_enrichment(
@@ -131,6 +144,7 @@ class EnrichmentManager:
                 "status": "processing",
                 "statusReason": None,
                 "lastStatusChange": now,
+                "mode": job.mode,
             }
         )
 
@@ -155,6 +169,7 @@ class EnrichmentManager:
                     "status": "error",
                     "statusReason": reason,
                     "lastStatusChange": error_time,
+                    "mode": job.mode,
                 }
             )
             if job.completed + job.errors >= job.total:
@@ -179,6 +194,7 @@ class EnrichmentManager:
                     "status": "error",
                     "statusReason": reason,
                     "lastStatusChange": error_time,
+                    "mode": job.mode,
                 }
             )
             if job.completed + job.errors >= job.total:
@@ -216,6 +232,86 @@ class EnrichmentManager:
                 "languageConfidence": enriched.get("language_confidence"),
                 "emails": enriched.get("emails", []),
                 "lastUpdated": enriched.get("last_updated") or success_time,
+                "mode": job.mode,
+            }
+        )
+
+        if job.completed + job.errors >= job.total:
+            job.mark_done()
+
+    def _process_channel_email_only(self, job: EnrichmentJob, channel: Dict) -> None:
+        channel_id = channel["channel_id"]
+        start_time = dt.datetime.utcnow().isoformat()
+
+        job.push_update(
+            {
+                "type": "channel",
+                "channelId": channel_id,
+                "status": "processing",
+                "statusReason": None,
+                "lastStatusChange": start_time,
+                "mode": job.mode,
+            }
+        )
+
+        try:
+            enriched = enrich_channel_email_only(channel)
+        except EnrichmentError as exc:
+            error_time = dt.datetime.utcnow().isoformat()
+            reason = str(exc)
+            job.update_counts(completed=False)
+            job.push_update(
+                {
+                    "type": "channel",
+                    "channelId": channel_id,
+                    "status": "error",
+                    "statusReason": reason,
+                    "lastStatusChange": error_time,
+                    "mode": job.mode,
+                }
+            )
+            if job.completed + job.errors >= job.total:
+                job.mark_done()
+            return
+        except Exception as exc:  # pragma: no cover - defensive guard
+            error_time = dt.datetime.utcnow().isoformat()
+            reason = f"Unexpected error: {exc}"[:500]
+            job.update_counts(completed=False)
+            job.push_update(
+                {
+                    "type": "channel",
+                    "channelId": channel_id,
+                    "status": "error",
+                    "statusReason": reason,
+                    "lastStatusChange": error_time,
+                    "mode": job.mode,
+                }
+            )
+            if job.completed + job.errors >= job.total:
+                job.mark_done()
+            return
+
+        success_time = dt.datetime.utcnow().isoformat()
+        emails = enriched.get("emails") or []
+        emails_value = ", ".join(emails) if emails else None
+        last_updated = enriched.get("last_updated") or success_time
+        database.update_channel_enrichment(
+            channel_id,
+            emails=emails_value,
+            last_updated=last_updated,
+        )
+
+        job.update_counts(completed=True)
+        job.push_update(
+            {
+                "type": "channel",
+                "channelId": channel_id,
+                "status": "completed",
+                "statusReason": None,
+                "lastStatusChange": success_time,
+                "emails": emails,
+                "lastUpdated": last_updated,
+                "mode": job.mode,
             }
         )
 

@@ -12,9 +12,11 @@ const state = {
   rows: new Map(),
   eventSource: null,
   currentJobId: null,
+  currentJobMode: null,
   progress: { total: 0, completed: 0, errors: 0, pending: 0, durationSeconds: 0 },
   emailsOnly: false,
   includeArchived: false,
+  enrichmentBusy: false,
 };
 
 const statusEl = document.getElementById('status');
@@ -26,6 +28,8 @@ const pageInfo = document.getElementById('pageInfo');
 const archiveAllBtn = document.getElementById('archiveAllBtn');
 const emailsToggle = document.getElementById('emailsToggle');
 const hideArchivedToggle = document.getElementById('hideArchivedToggle');
+const enrichBtn = document.getElementById('enrichBtn');
+const enrichEmailBtn = document.getElementById('enrichEmailBtn');
 const archivingInFlight = new Set();
 
 async function fetchJSON(url, options = {}) {
@@ -81,6 +85,26 @@ function buildQueryParams({ includePagination = true } = {}) {
 function setStatus(message, type = 'info') {
   statusEl.textContent = message;
   statusEl.dataset.type = type;
+}
+
+function describeMode(mode) {
+  switch (mode) {
+    case 'email_only':
+      return 'Email-only';
+    case 'full':
+    default:
+      return 'Full';
+  }
+}
+
+function setEnrichmentBusy(disabled) {
+  state.enrichmentBusy = disabled;
+  if (enrichBtn) {
+    enrichBtn.disabled = disabled;
+  }
+  if (enrichEmailBtn) {
+    enrichEmailBtn.disabled = disabled;
+  }
 }
 
 function setProgress(message) {
@@ -275,6 +299,7 @@ function updateChannelRowFromStream(update) {
     return;
   }
   const { item, element } = entry;
+  const isEmailOnly = update.mode === 'email_only';
   if (typeof update.subscribers === 'number') {
     item.subscribers = update.subscribers;
   }
@@ -290,13 +315,13 @@ function updateChannelRowFromStream(update) {
   if (update.lastUpdated) {
     item.last_updated = update.lastUpdated;
   }
-  if (update.lastStatusChange) {
+  if (!isEmailOnly && update.lastStatusChange) {
     item.last_status_change = update.lastStatusChange;
   }
-  if (update.status) {
+  if (!isEmailOnly && update.status) {
     item.status = update.status;
   }
-  if ('statusReason' in update) {
+  if (!isEmailOnly && 'statusReason' in update) {
     item.status_reason = update.statusReason || '';
   }
   if (typeof update.archived === 'boolean') {
@@ -423,7 +448,8 @@ function updateProgressText() {
     setProgress('');
     return;
   }
-  setProgress(`Enrichment: ${completed} completed · ${errors} error · ${pending} pending`);
+  const modeLabel = state.currentJobMode ? ` (${describeMode(state.currentJobMode)})` : '';
+  setProgress(`Enrichment${modeLabel}: ${completed} completed · ${errors} error · ${pending} pending`);
 }
 
 function formatDuration(seconds) {
@@ -441,15 +467,17 @@ function formatDuration(seconds) {
 
 function resetProgress() {
   state.progress = { total: 0, completed: 0, errors: 0, pending: 0, durationSeconds: 0 };
+  state.currentJobMode = null;
   updateProgressText();
 }
 
-function startEnrichmentStream(jobId, total) {
+function startEnrichmentStream(jobId, total, mode) {
   if (state.eventSource) {
     state.eventSource.close();
     state.eventSource = null;
   }
   state.currentJobId = jobId;
+  state.currentJobMode = mode || state.currentJobMode || 'full';
   state.progress = { total, completed: 0, errors: 0, pending: total, durationSeconds: 0 };
   updateProgressText();
   setBatchSummary('');
@@ -466,6 +494,9 @@ function startEnrichmentStream(jobId, total) {
       if (payload.type === 'channel') {
         updateChannelRowFromStream(payload);
       } else if (payload.type === 'progress') {
+        if (payload.mode) {
+          state.currentJobMode = payload.mode;
+        }
         state.progress = {
           total: payload.total ?? state.progress.total,
           completed: payload.completed ?? state.progress.completed,
@@ -488,7 +519,12 @@ function startEnrichmentStream(jobId, total) {
       state.eventSource.close();
       state.eventSource = null;
     }
-    if (state.currentJobId) {
+    setEnrichmentBusy(false);
+    const hadJob = Boolean(state.currentJobId);
+    state.currentJobId = null;
+    state.currentJobMode = null;
+    resetProgress();
+    if (hadJob) {
       setStatus('Connection to enrichment stream lost.', 'error');
     }
   };
@@ -502,10 +538,12 @@ function finalizeEnrichment() {
   const { completed, errors, durationSeconds } = state.progress;
   const durationText = formatDuration(durationSeconds);
   const summary = `${completed} ok, ${errors} error${durationText ? `, ${durationText}` : ''}`;
-  setBatchSummary(summary);
-  setStatus(`Enrichment finished: ${summary}.`, errors ? 'warning' : 'success');
+  const modeLabel = describeMode(state.currentJobMode || 'full');
+  setBatchSummary(`${modeLabel} job: ${summary}`);
+  setStatus(`${modeLabel} enrichment finished: ${summary}.`, errors ? 'warning' : 'success');
   state.currentJobId = null;
-  updateProgressText();
+  setEnrichmentBusy(false);
+  resetProgress();
   loadChannels();
   pollStats();
 }
@@ -546,30 +584,52 @@ async function handleDiscover() {
   }
 }
 
-async function handleEnrich() {
-  setStatus('Starting enrichment…');
+async function startEnrichment(mode) {
+  if (state.enrichmentBusy) {
+    return;
+  }
+  setEnrichmentBusy(true);
   resetProgress();
+  setBatchSummary('');
+  const modeLabel = describeMode(mode);
+  setStatus(`${modeLabel} enrichment starting…`);
   try {
     const response = await fetchJSON('/api/enrich', {
       method: 'POST',
-      body: JSON.stringify({ limit: 40 }),
+      body: JSON.stringify({ limit: 40, mode }),
     });
     if (!response || typeof response.jobId !== 'string') {
       setStatus('Failed to start enrichment job.', 'error');
-      return;
-    }
-    if (response.total === 0) {
-      setStatus('No channels waiting for enrichment.', 'info');
-      setBatchSummary('');
+      setEnrichmentBusy(false);
       resetProgress();
       return;
     }
-    setStatus(`Enrichment started for ${response.total} channel${response.total === 1 ? '' : 's'}.`, 'info');
-    startEnrichmentStream(response.jobId, response.total);
+    const jobMode = response.mode || mode;
+    const jobModeLabel = describeMode(jobMode);
+    if (response.total === 0) {
+      setStatus(`No channels waiting for ${jobModeLabel.toLowerCase()} enrichment.`, 'info');
+      setBatchSummary('');
+      setEnrichmentBusy(false);
+      resetProgress();
+      return;
+    }
+    state.currentJobMode = jobMode;
+    setStatus(`${jobModeLabel} enrichment started for ${response.total} channel${response.total === 1 ? '' : 's'}.`, 'info');
+    startEnrichmentStream(response.jobId, response.total, jobMode);
   } catch (error) {
     console.error(error);
-    setStatus(`Enrichment failed: ${error.message}`, 'error');
+    setStatus(`${modeLabel} enrichment failed: ${error.message}`, 'error');
+    setEnrichmentBusy(false);
+    resetProgress();
   }
+}
+
+async function handleEnrich() {
+  await startEnrichment('full');
+}
+
+async function handleEnrichEmailOnly() {
+  await startEnrichment('email_only');
 }
 
 async function handleExport() {
@@ -613,7 +673,12 @@ async function pollStats() {
 
 function initEvents() {
   document.getElementById('discoverBtn').addEventListener('click', handleDiscover);
-  document.getElementById('enrichBtn').addEventListener('click', handleEnrich);
+  if (enrichBtn) {
+    enrichBtn.addEventListener('click', handleEnrich);
+  }
+  if (enrichEmailBtn) {
+    enrichEmailBtn.addEventListener('click', handleEnrichEmailOnly);
+  }
   document.getElementById('exportBtn').addEventListener('click', handleExport);
   if (archiveAllBtn) {
     archiveAllBtn.addEventListener('click', handleArchiveBulk);

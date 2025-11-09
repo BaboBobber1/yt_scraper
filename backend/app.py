@@ -167,8 +167,12 @@ def api_enrich(payload: Dict[str, Any] = Body(default={})) -> JSONResponse:
         if limit <= 0:
             raise HTTPException(status_code=400, detail="limit must be greater than zero")
 
-    job = manager.start_job(limit)
-    return JSONResponse({"jobId": job.job_id, "total": job.total})
+    mode = payload.get("mode", "full")
+    if mode not in {"full", "email_only"}:
+        raise HTTPException(status_code=400, detail="mode must be 'full' or 'email_only'")
+
+    job = manager.start_job(limit, mode=mode)
+    return JSONResponse({"jobId": job.job_id, "total": job.total, "mode": job.mode})
 
 
 @app.get("/api/enrich/stream/{job_id}")

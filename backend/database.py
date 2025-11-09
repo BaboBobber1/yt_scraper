@@ -327,6 +327,19 @@ def get_pending_channels(limit: Optional[int]) -> List[Dict[str, Any]]:
         return [dict(row) for row in cursor.fetchall()]
 
 
+def get_channels_for_email_enrichment(limit: Optional[int]) -> List[Dict[str, Any]]:
+    limit_clause = "LIMIT ?" if limit is not None else ""
+    params: Tuple[Any, ...] = (limit,) if limit is not None else tuple()
+    query = (
+        "SELECT * FROM channels WHERE (archived IS NULL OR archived = 0) "
+        "ORDER BY last_updated IS NULL DESC, last_updated ASC "
+        + limit_clause
+    )
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+
 def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[str]:
     if not channel_ids:
         return []
