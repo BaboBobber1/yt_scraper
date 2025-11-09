@@ -34,6 +34,19 @@
       </section>
 
       <section class="table-section">
+        <div class="list-toolbar">
+          <div class="toggle-group">
+            <label class="toggle">
+              <input type="checkbox" id="emailsToggle" />
+              <span>Only emails</span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="hideArchivedToggle" checked />
+              <span>Hide archived</span>
+            </label>
+          </div>
+          <button id="archiveAllBtn" class="ghost-button">Archive all (current filter)</button>
+        </div>
         <div class="filters-grid">
           <div class="field">
             <label for="search">Search</label>
@@ -91,6 +104,7 @@
               <th>Status</th>
               <th>Last updated</th>
               <th>Error</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody></tbody>

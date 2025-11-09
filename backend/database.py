@@ -52,7 +52,9 @@ def init_db() -> None:
                 last_error TEXT,
                 status TEXT NOT NULL DEFAULT 'new',
                 status_reason TEXT,
-                last_status_change TEXT
+                last_status_change TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at TEXT
             )
             """
         )
@@ -60,6 +62,8 @@ def init_db() -> None:
         _ensure_column(cursor, "channels", "status", "TEXT NOT NULL DEFAULT 'new'")
         _ensure_column(cursor, "channels", "status_reason", "TEXT")
         _ensure_column(cursor, "channels", "last_status_change", "TEXT")
+        _ensure_column(cursor, "channels", "archived", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(cursor, "channels", "archived_at", "TEXT")
         # Legacy field cleanup: drop needs_enrichment if present but unused by new status model.
         # We keep the column to avoid destructive migrations but ensure defaults align.
 
@@ -81,8 +85,9 @@ def insert_channel(channel: Dict[str, Any]) -> bool:
                     channel_id, title, url, subscribers, language,
                     language_confidence, emails, last_updated, created_at,
                     last_attempted, needs_enrichment, last_error,
-                    status, status_reason, last_status_change
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, status_reason, last_status_change,
+                    archived, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     channel["channel_id"],
@@ -100,6 +105,8 @@ def insert_channel(channel: Dict[str, Any]) -> bool:
                     channel.get("status", "new"),
                     channel.get("status_reason"),
                     channel.get("last_status_change"),
+                    1 if channel.get("archived") else 0,
+                    channel.get("archived_at"),
                 ),
             )
             return True
@@ -199,30 +206,16 @@ def get_channel_totals() -> Dict[str, int]:
         }
 
 
-def get_channels(
+def _build_channel_filters(
     *,
     query_text: Optional[str],
     languages: Optional[Sequence[str]],
     statuses: Optional[Sequence[str]],
     min_subscribers: Optional[int],
     max_subscribers: Optional[int],
-    sort: str,
-    order: str,
-    limit: int,
-    offset: int,
-) -> Tuple[List[Dict[str, Any]], int]:
-    valid_sorts = {
-        "title": "title",
-        "subscribers": "subscribers",
-        "language": "language",
-        "last_updated": "last_updated",
-        "created_at": "created_at",
-        "status": "status",
-        "last_status_change": "last_status_change",
-    }
-    sort_column = valid_sorts.get(sort, "created_at")
-    order_direction = "DESC" if order.lower() == "desc" else "ASC"
-
+    emails_only: bool,
+    include_archived: bool,
+) -> Tuple[str, List[Any]]:
     clauses: List[str] = []
     params: List[Any] = []
 
@@ -249,7 +242,51 @@ def get_channels(
         clauses.append("(subscribers IS NOT NULL AND subscribers <= ?)")
         params.append(max_subscribers)
 
+    if emails_only:
+        clauses.append("(emails IS NOT NULL AND TRIM(emails) != '')")
+
+    if not include_archived:
+        clauses.append("(archived IS NULL OR archived = 0)")
+
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where_clause, params
+
+
+def get_channels(
+    *,
+    query_text: Optional[str],
+    languages: Optional[Sequence[str]],
+    statuses: Optional[Sequence[str]],
+    min_subscribers: Optional[int],
+    max_subscribers: Optional[int],
+    sort: str,
+    order: str,
+    limit: int,
+    offset: int,
+    emails_only: bool,
+    include_archived: bool,
+) -> Tuple[List[Dict[str, Any]], int]:
+    valid_sorts = {
+        "title": "title",
+        "subscribers": "subscribers",
+        "language": "language",
+        "last_updated": "last_updated",
+        "created_at": "created_at",
+        "status": "status",
+        "last_status_change": "last_status_change",
+    }
+    sort_column = valid_sorts.get(sort, "created_at")
+    order_direction = "DESC" if order.lower() == "desc" else "ASC"
+
+    where_clause, params = _build_channel_filters(
+        query_text=query_text,
+        languages=languages,
+        statuses=statuses,
+        min_subscribers=min_subscribers,
+        max_subscribers=max_subscribers,
+        emails_only=emails_only,
+        include_archived=include_archived,
+    )
 
     query = (
         f"SELECT * FROM channels {where_clause} "
@@ -268,7 +305,11 @@ def get_channels(
         total_row = cursor.fetchone()
         total = total_row[0] if total_row else 0
 
-    items = [dict(row) for row in rows]
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["archived"] = bool(item.get("archived"))
+        items.append(item)
     return items, total
 
 
@@ -277,12 +318,39 @@ def get_pending_channels(limit: Optional[int]) -> List[Dict[str, Any]]:
     params: Tuple[Any, ...] = (limit,) if limit is not None else tuple()
     query = (
         "SELECT * FROM channels WHERE status IN ('new', 'error') "
+        "AND (archived IS NULL OR archived = 0) "
         "ORDER BY last_attempted IS NULL DESC, last_attempted ASC "
         + limit_clause
     )
     with get_cursor() as cursor:
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
+
+
+def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[str]:
+    if not channel_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in channel_ids)
+    params: List[Any] = list(channel_ids)
+
+    with get_cursor() as cursor:
+        cursor.execute(
+            f"SELECT channel_id FROM channels WHERE channel_id IN ({placeholders}) "
+            "AND (archived IS NULL OR archived = 0)",
+            params,
+        )
+        targets = [row[0] for row in cursor.fetchall()]
+        if not targets:
+            return []
+
+        target_placeholders = ",".join("?" for _ in targets)
+        cursor.execute(
+            f"UPDATE channels SET archived = 1, archived_at = ?, needs_enrichment = 0 "
+            f"WHERE channel_id IN ({target_placeholders})",
+            [timestamp, *targets],
+        )
+        return targets
 
 
 def set_channel_status(channel_id: str, status: str, *, reason: Optional[str], timestamp: Optional[str]) -> None:

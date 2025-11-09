@@ -65,6 +65,8 @@ def _collect_filters(
     statuses: Optional[List[str]],
     min_subscribers: Optional[str],
     max_subscribers: Optional[str],
+    emails_only: bool,
+    include_archived: bool,
 ) -> Dict[str, Any]:
     language_values = [value.lower() for value in _parse_multi(languages) or []] or None
     status_values = [value.lower() for value in _parse_multi(statuses) or []] or None
@@ -89,6 +91,8 @@ def _collect_filters(
         "statuses": status_values,
         "min_subscribers": min_subs_int,
         "max_subscribers": max_subs_int,
+        "emails_only": emails_only,
+        "include_archived": include_archived,
     }
 
 
@@ -141,6 +145,8 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                     "status": "new",
                     "status_reason": None,
                     "last_status_change": now,
+                    "archived": False,
+                    "archived_at": None,
                 }
             )
 
@@ -189,6 +195,8 @@ def api_channels(
     order: str = Query(default="desc"),
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
+    emails_only: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
 ) -> JSONResponse:
     filters = _collect_filters(
         q=q,
@@ -196,6 +204,8 @@ def api_channels(
         statuses=status,
         min_subscribers=min_subscribers,
         max_subscribers=max_subscribers,
+        emails_only=emails_only,
+        include_archived=include_archived,
     )
 
     items, total = database.get_channels(
@@ -203,9 +213,73 @@ def api_channels(
         order=order,
         limit=limit,
         offset=offset,
+        emails_only=emails_only,
+        include_archived=include_archived,
         **filters,
     )
     return JSONResponse({"items": items, "total": total})
+
+
+@app.post("/api/channels/{channel_id}/archive")
+def api_archive_channel(channel_id: str) -> JSONResponse:
+    timestamp = dt.datetime.utcnow().isoformat()
+    archived_ids = database.archive_channels_by_ids([channel_id], timestamp)
+    if not archived_ids:
+        raise HTTPException(status_code=404, detail="Channel not found or already archived")
+    return JSONResponse({"archived": len(archived_ids), "archivedIds": archived_ids, "archivedAt": timestamp})
+
+
+@app.post("/api/channels/archive_bulk")
+def api_archive_bulk(
+    payload: Dict[str, Any] = Body(default={}),
+    q: Optional[str] = Query(default=None),
+    language: Optional[List[str]] = Query(default=None),
+    status: Optional[List[str]] = Query(default=None),
+    min_subscribers: Optional[str] = Query(default=None),
+    max_subscribers: Optional[str] = Query(default=None),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc"),
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+    emails_only: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
+) -> JSONResponse:
+    channel_ids: Optional[List[str]] = None
+    if isinstance(payload, dict):
+        ids = payload.get("channel_ids")
+        if ids is not None:
+            if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
+                raise HTTPException(status_code=400, detail="channel_ids must be a list of strings")
+            channel_ids = ids
+        filter_mode = payload.get("filter")
+        if filter_mode == "emails_only":
+            emails_only = True
+
+    timestamp = dt.datetime.utcnow().isoformat()
+
+    if channel_ids is None:
+        filters = _collect_filters(
+            q=q,
+            languages=language,
+            statuses=status,
+            min_subscribers=min_subscribers,
+            max_subscribers=max_subscribers,
+            emails_only=emails_only,
+            include_archived=include_archived,
+        )
+        items, _ = database.get_channels(
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+            emails_only=emails_only,
+            include_archived=include_archived,
+            **filters,
+        )
+        channel_ids = [item["channel_id"] for item in items]
+
+    archived_ids = database.archive_channels_by_ids(channel_ids or [], timestamp)
+    return JSONResponse({"archived": len(archived_ids), "archivedIds": archived_ids, "archivedAt": timestamp})
 
 
 @app.get("/api/export/csv")
@@ -217,6 +291,8 @@ def api_export_csv(
     max_subscribers: Optional[str] = Query(default=None),
     sort: str = Query(default="created_at"),
     order: str = Query(default="desc"),
+    emails_only: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
 ) -> PlainTextResponse:
     filters = _collect_filters(
         q=q,
@@ -224,6 +300,8 @@ def api_export_csv(
         statuses=status,
         min_subscribers=min_subscribers,
         max_subscribers=max_subscribers,
+        emails_only=emails_only,
+        include_archived=include_archived,
     )
 
     items, _ = database.get_channels(
@@ -231,6 +309,8 @@ def api_export_csv(
         order=order,
         limit=10_000,
         offset=0,
+        emails_only=emails_only,
+        include_archived=include_archived,
         **filters,
     )
     headers = [
