@@ -414,7 +414,7 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
             break
 
     return {
-        "title": feed_title or channel.get("title"),
+        "name": feed_title or channel.get("name") or channel.get("title"),
         "subscribers": watch.get("subscribers"),
         "language": lang_result["language"] if lang_result else (watch.get("language") or None),
         "language_confidence": lang_result["confidence"] if lang_result else None,

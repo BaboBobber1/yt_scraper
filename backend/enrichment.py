@@ -208,7 +208,7 @@ class EnrichmentManager:
         emails = ", ".join(enriched_emails) if enriched_emails else None
         database.update_channel_enrichment(
             channel_id,
-            title=enriched.get("title") or channel.get("title"),
+            name=enriched.get("name") or enriched.get("title") or channel.get("name") or channel.get("title"),
             subscribers=enriched.get("subscribers"),
             language=enriched.get("language"),
             language_confidence=enriched.get("language_confidence"),

@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -15,6 +16,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _connection_lock = threading.Lock()
 _connection: Optional[sqlite3.Connection] = None
 
+
 def _get_connection() -> sqlite3.Connection:
     global _connection
     if _connection is None:
@@ -22,6 +24,7 @@ def _get_connection() -> sqlite3.Connection:
         _connection = sqlite3.connect(DB_PATH, check_same_thread=False)
         _connection.row_factory = sqlite3.Row
     return _connection
+
 
 @contextmanager
 def get_cursor():
@@ -34,40 +37,67 @@ def get_cursor():
         finally:
             cursor.close()
 
+
+class ChannelCategory(str, Enum):
+    """Available logical channel collections."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    BLACKLISTED = "blacklisted"
+
+
+CHANNEL_TABLES = {
+    ChannelCategory.ACTIVE: "channels_active",
+    ChannelCategory.ARCHIVED: "channels_archived",
+    ChannelCategory.BLACKLISTED: "channels_blacklisted",
+}
+
+CHANNEL_COLUMNS = [
+    "channel_id",
+    "name",
+    "url",
+    "subscribers",
+    "language",
+    "language_confidence",
+    "emails",
+    "last_updated",
+    "created_at",
+    "last_attempted",
+    "needs_enrichment",
+    "last_error",
+    "status",
+    "status_reason",
+    "last_status_change",
+]
+
+LEGACY_TABLE = "channels"
+
+
 def init_db() -> None:
     with get_cursor() as cursor:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL UNIQUE,
-                title TEXT,
-                url TEXT NOT NULL,
-                subscribers INTEGER,
-                language TEXT,
-                language_confidence REAL,
-                emails TEXT,
-                last_updated TEXT,
-                created_at TEXT NOT NULL,
-                last_attempted TEXT,
-                needs_enrichment INTEGER NOT NULL DEFAULT 1,
-                last_error TEXT,
-                status TEXT NOT NULL DEFAULT 'new',
-                status_reason TEXT,
-                last_status_change TEXT,
-                archived INTEGER NOT NULL DEFAULT 0,
-                archived_at TEXT,
-                blacklisted INTEGER NOT NULL DEFAULT 0
+        for table in CHANNEL_TABLES.values():
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT NOT NULL UNIQUE,
+                    name TEXT,
+                    url TEXT NOT NULL,
+                    subscribers INTEGER,
+                    language TEXT,
+                    language_confidence REAL,
+                    emails TEXT,
+                    last_updated TEXT,
+                    created_at TEXT NOT NULL,
+                    last_attempted TEXT,
+                    needs_enrichment INTEGER NOT NULL DEFAULT 1,
+                    last_error TEXT,
+                    status TEXT NOT NULL DEFAULT 'new',
+                    status_reason TEXT,
+                    last_status_change TEXT
+                )
+                """
             )
-            """
-        )
-
-        _ensure_column(cursor, "channels", "status", "TEXT NOT NULL DEFAULT 'new'")
-        _ensure_column(cursor, "channels", "status_reason", "TEXT")
-        _ensure_column(cursor, "channels", "last_status_change", "TEXT")
-        _ensure_column(cursor, "channels", "archived", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(cursor, "channels", "archived_at", "TEXT")
-        _ensure_column(cursor, "channels", "blacklisted", "INTEGER NOT NULL DEFAULT 0")
 
         cursor.execute(
             """
@@ -107,8 +137,57 @@ def init_db() -> None:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_emails_email ON channel_emails(email)"
         )
-        # Legacy field cleanup: drop needs_enrichment if present but unused by new status model.
-        # We keep the column to avoid destructive migrations but ensure defaults align.
+
+        _migrate_legacy_channels(cursor)
+
+
+def _migrate_legacy_channels(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (LEGACY_TABLE,),
+    )
+    if not cursor.fetchone():
+        return
+
+    cursor.execute(f"SELECT COUNT(*) AS count FROM {LEGACY_TABLE}")
+    legacy_count = cursor.fetchone()["count"]
+    if legacy_count == 0:
+        cursor.execute(f"ALTER TABLE {LEGACY_TABLE} RENAME TO {LEGACY_TABLE}_legacy")
+        return
+
+    cursor.execute(f"SELECT * FROM {LEGACY_TABLE}")
+    rows = cursor.fetchall()
+    for row in rows:
+        record = dict(row)
+        channel_id = record.get("channel_id")
+        if not channel_id:
+            continue
+        destination = ChannelCategory.ACTIVE
+        if record.get("blacklisted"):
+            destination = ChannelCategory.BLACKLISTED
+        elif record.get("archived"):
+            destination = ChannelCategory.ARCHIVED
+
+        payload = {
+            "channel_id": channel_id,
+            "name": record.get("title"),
+            "url": ensure_channel_url(channel_id, record.get("url")),
+            "subscribers": record.get("subscribers"),
+            "language": record.get("language"),
+            "language_confidence": record.get("language_confidence"),
+            "emails": record.get("emails"),
+            "last_updated": record.get("last_updated"),
+            "created_at": record.get("created_at") or record.get("last_updated"),
+            "last_attempted": record.get("last_attempted"),
+            "needs_enrichment": record.get("needs_enrichment", 1),
+            "last_error": record.get("last_error"),
+            "status": record.get("status", "new"),
+            "status_reason": record.get("status_reason"),
+            "last_status_change": record.get("last_status_change"),
+        }
+        _insert_or_replace(cursor, CHANNEL_TABLES[destination], payload)
+
+    cursor.execute(f"ALTER TABLE {LEGACY_TABLE} RENAME TO {LEGACY_TABLE}_legacy")
 
 
 @dataclass(frozen=True)
@@ -142,30 +221,30 @@ def parse_email_candidates(value: Optional[str]) -> List[str]:
 def is_blacklisted(channel_id: str) -> bool:
     with get_cursor() as cursor:
         cursor.execute(
-            "SELECT 1 FROM blacklist WHERE channel_id = ?",
+            f"SELECT 1 FROM {CHANNEL_TABLES[ChannelCategory.BLACKLISTED]} WHERE channel_id = ?",
             (channel_id,),
         )
         if cursor.fetchone():
             return True
         cursor.execute(
-            "SELECT 1 FROM channels WHERE channel_id = ? AND blacklisted = 1",
+            "SELECT 1 FROM blacklist WHERE channel_id = ?",
             (channel_id,),
         )
         return cursor.fetchone() is not None
 
 
-def upsert_blacklist_channel(channel_id: str, timestamp: str) -> Tuple[bool, bool]:
+def ensure_blacklisted_channel(channel_id: str, timestamp: str) -> Tuple[bool, bool]:
+    """Ensure a record exists for the channel in the blacklist tables."""
+
     created = False
     updated = False
-    url = ensure_channel_url(channel_id, None)
 
     with get_cursor() as cursor:
         cursor.execute(
             "SELECT channel_id FROM blacklist WHERE channel_id = ?",
             (channel_id,),
         )
-        row = cursor.fetchone()
-        if row:
+        if cursor.fetchone():
             updated = True
             cursor.execute(
                 "UPDATE blacklist SET updated_at = ? WHERE channel_id = ?",
@@ -179,115 +258,90 @@ def upsert_blacklist_channel(channel_id: str, timestamp: str) -> Tuple[bool, boo
             )
 
         cursor.execute(
-            "SELECT channel_id FROM channels WHERE channel_id = ?",
+            f"SELECT * FROM {CHANNEL_TABLES[ChannelCategory.BLACKLISTED]} WHERE channel_id = ?",
             (channel_id,),
         )
-        channel_exists = cursor.fetchone() is not None
-        if channel_exists:
-            cursor.execute(
-                """
-                UPDATE channels
-                SET archived = 1,
-                    archived_at = COALESCE(archived_at, ?),
-                    needs_enrichment = 0,
-                    blacklisted = 1,
-                    status = 'blacklisted',
-                    status_reason = 'Blacklisted',
-                    last_status_change = COALESCE(last_status_change, ?)
-                WHERE channel_id = ?
-                """,
-                (timestamp, timestamp, channel_id),
-            )
+        existing = cursor.fetchone()
+        if existing is None:
+            payload = {
+                "channel_id": channel_id,
+                "name": None,
+                "url": ensure_channel_url(channel_id, None),
+                "subscribers": None,
+                "language": None,
+                "language_confidence": None,
+                "emails": None,
+                "last_updated": None,
+                "created_at": timestamp,
+                "last_attempted": None,
+                "needs_enrichment": 0,
+                "last_error": None,
+                "status": "blacklisted",
+                "status_reason": "Blacklisted",
+                "last_status_change": timestamp,
+            }
+            _insert_or_replace(cursor, CHANNEL_TABLES[ChannelCategory.BLACKLISTED], payload)
+        return updated, created
+
+
+def _prepare_channel_payload(channel: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for column in CHANNEL_COLUMNS:
+        if column == "needs_enrichment":
+            value = channel.get(column)
+            if value is None:
+                value = 1
+            payload[column] = int(bool(value))
         else:
-            cursor.execute(
-                """
-                INSERT INTO channels (
-                    channel_id, title, url, subscribers, language,
-                    language_confidence, emails, last_updated, created_at,
-                    last_attempted, needs_enrichment, last_error,
-                    status, status_reason, last_status_change,
-                    archived, archived_at, blacklisted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    channel_id,
-                    None,
-                    url,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    timestamp,
-                    None,
-                    0,
-                    None,
-                    'blacklisted',
-                    'Blacklisted',
-                    timestamp,
-                    1,
-                    timestamp,
-                    1,
-                ),
-            )
-
-    return updated, created
+            payload[column] = channel.get(column)
+    if payload.get("name") is None:
+        payload["name"] = channel.get("title")
+    if not payload.get("created_at"):
+        payload["created_at"] = channel.get("created_at") or channel.get("last_updated")
+    payload["url"] = ensure_channel_url(channel.get("channel_id"), payload.get("url"))
+    return payload
 
 
-def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
-    cursor.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in cursor.fetchall()}
-    if column not in existing:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+def _insert_or_replace(cursor: sqlite3.Cursor, table: str, payload: Dict[str, Any]) -> None:
+    columns = ", ".join(CHANNEL_COLUMNS)
+    placeholders = ", ".join("?" for _ in CHANNEL_COLUMNS)
+    updates = ", ".join(f"{column} = excluded.{column}" for column in CHANNEL_COLUMNS if column != "channel_id")
+    values = [payload.get(column) for column in CHANNEL_COLUMNS]
+    cursor.execute(
+        f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
+        f"ON CONFLICT(channel_id) DO UPDATE SET {updates}",
+        values,
+    )
 
 
-def insert_channel(channel: Dict[str, Any]) -> bool:
-    """Insert a new channel. Returns True if inserted, False if duplicate."""
+def insert_channel(channel: Dict[str, Any], *, category: ChannelCategory = ChannelCategory.ACTIVE) -> bool:
+    """Insert a new channel. Returns True if inserted, False if duplicate or blacklisted."""
+
     channel_id = channel["channel_id"]
-    if is_blacklisted(channel_id):
+    if category != ChannelCategory.BLACKLISTED and is_blacklisted(channel_id):
         return False
+
+    payload = _prepare_channel_payload(channel)
     with get_cursor() as cursor:
         try:
+            columns = ", ".join(CHANNEL_COLUMNS)
+            placeholders = ", ".join("?" for _ in CHANNEL_COLUMNS)
+            values = [payload.get(column) for column in CHANNEL_COLUMNS]
             cursor.execute(
-                """
-                INSERT INTO channels (
-                    channel_id, title, url, subscribers, language,
-                    language_confidence, emails, last_updated, created_at,
-                    last_attempted, needs_enrichment, last_error,
-                    status, status_reason, last_status_change,
-                    archived, archived_at, blacklisted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    channel_id,
-                    channel.get("title"),
-                    channel.get("url"),
-                    channel.get("subscribers"),
-                    channel.get("language"),
-                    channel.get("language_confidence"),
-                    channel.get("emails"),
-                    channel.get("last_updated"),
-                    channel.get("created_at"),
-                    channel.get("last_attempted"),
-                    1 if channel.get("needs_enrichment", True) else 0,
-                    channel.get("last_error"),
-                    channel.get("status", "new"),
-                    channel.get("status_reason"),
-                    channel.get("last_status_change"),
-                    1 if channel.get("archived") else 0,
-                    channel.get("archived_at"),
-                    1 if channel.get("blacklisted") else 0,
-                ),
+                f"INSERT INTO {CHANNEL_TABLES[category]} ({columns}) VALUES ({placeholders})",
+                values,
             )
             return True
         except sqlite3.IntegrityError:
             return False
 
 
-def bulk_insert_channels(channels: Iterable[Dict[str, Any]]) -> int:
+def bulk_insert_channels(
+    channels: Iterable[Dict[str, Any]], *, category: ChannelCategory = ChannelCategory.ACTIVE
+) -> int:
     inserted = 0
     for channel in channels:
-        if insert_channel(channel):
+        if insert_channel(channel, category=category):
             inserted += 1
     return inserted
 
@@ -361,25 +415,28 @@ def has_all_known_emails(emails: Iterable[str]) -> bool:
     return rows == set(params)
 
 
-def get_unique_email_rows(filters: ChannelFilters) -> List[Dict[str, Any]]:
+def get_unique_email_rows(
+    filters: ChannelFilters, *, category: ChannelCategory = ChannelCategory.ACTIVE
+) -> List[Dict[str, Any]]:
+    table = CHANNEL_TABLES[category]
     where_clause, params = _build_channel_filters(filters, table_alias="c")
     query = (
         """
         SELECT
             ce.email,
             c.channel_id,
-            c.title,
+            c.name,
             c.url,
             c.last_updated,
             c.created_at,
             eu.first_seen_channel_id,
             eu.last_seen_at
         FROM channel_emails ce
-        JOIN channels c ON c.channel_id = ce.channel_id
+        JOIN {table} c ON c.channel_id = ce.channel_id
         LEFT JOIN emails_unique eu ON eu.email = ce.email
         {where_clause}
         ORDER BY eu.last_seen_at DESC, c.last_updated DESC, c.created_at DESC
-        """.format(where_clause=where_clause)
+        """.format(table=table, where_clause=where_clause)
     )
 
     with get_cursor() as cursor:
@@ -416,7 +473,7 @@ def get_unique_email_rows(filters: ChannelFilters) -> List[Dict[str, Any]]:
             {
                 "email": email,
                 "primary_channel_id": primary_row["channel_id"],
-                "primary_channel_name": primary_row["title"] or "",
+                "primary_channel_name": primary_row["name"] or "",
                 "primary_channel_url": ensure_channel_url(
                     primary_row["channel_id"], primary_row["url"]
                 ),
@@ -434,7 +491,7 @@ def get_unique_email_rows(filters: ChannelFilters) -> List[Dict[str, Any]]:
 def update_channel_enrichment(
     channel_id: str,
     *,
-    title: Optional[str] = None,
+    name: Optional[str] = None,
     subscribers: Optional[int] = None,
     language: Optional[str] = None,
     language_confidence: Optional[float] = None,
@@ -447,73 +504,74 @@ def update_channel_enrichment(
     status_reason: Optional[str] = None,
     last_status_change: Optional[str] = None,
 ) -> None:
-    fields: List[str] = []
-    values: List[Any] = []
-
-    def add(field: str, value: Any) -> None:
-        fields.append(f"{field} = ?")
-        values.append(value)
-
-    if title is not None:
-        add("title", title)
+    updates: Dict[str, Any] = {}
+    if name is not None:
+        updates["name"] = name
     if subscribers is not None:
-        add("subscribers", subscribers)
+        updates["subscribers"] = subscribers
     if language is not None:
-        add("language", language)
+        updates["language"] = language
     if language_confidence is not None:
-        add("language_confidence", language_confidence)
+        updates["language_confidence"] = language_confidence
     if emails is not None:
-        add("emails", emails)
+        updates["emails"] = emails
     if last_updated is not None:
-        add("last_updated", last_updated)
+        updates["last_updated"] = last_updated
     if last_attempted is not None:
-        add("last_attempted", last_attempted)
+        updates["last_attempted"] = last_attempted
     if needs_enrichment is not None:
-        add("needs_enrichment", 1 if needs_enrichment else 0)
+        updates["needs_enrichment"] = int(bool(needs_enrichment))
     if last_error is not None:
-        add("last_error", last_error)
+        updates["last_error"] = last_error
     if status is not None:
-        add("status", status)
+        updates["status"] = status
     if status_reason is not None:
-        add("status_reason", status_reason)
+        updates["status_reason"] = status_reason
     if last_status_change is not None:
-        add("last_status_change", last_status_change)
+        updates["last_status_change"] = last_status_change
 
-    if not fields:
+    if not updates:
         return
 
-    values.append(channel_id)
+    fields = ", ".join(f"{column} = ?" for column in updates)
+    values = list(updates.values())
 
     with get_cursor() as cursor:
-        cursor.execute(
-            f"UPDATE channels SET {', '.join(fields)} WHERE channel_id = ?",
-            values,
-        )
+        for category in ChannelCategory:
+            cursor.execute(
+                f"UPDATE {CHANNEL_TABLES[category]} SET {fields} WHERE channel_id = ?",
+                [*values, channel_id],
+            )
+            if cursor.rowcount:
+                break
 
 
-def get_channel_totals() -> Dict[str, int]:
-    with get_cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) AS new_count,
-                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing_count,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_count,
-                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
-            FROM channels
-            WHERE blacklisted IS NULL OR blacklisted = 0
-            """
-        )
-        row = cursor.fetchone()
-        total = row["total"] if row and row["total"] is not None else 0
-        return {
-            "total": total,
-            "new": row["new_count"] if row and row["new_count"] is not None else 0,
-            "processing": row["processing_count"] if row and row["processing_count"] is not None else 0,
-            "completed": row["completed_count"] if row and row["completed_count"] is not None else 0,
-            "error": row["error_count"] if row and row["error_count"] is not None else 0,
-        }
+def set_channel_status(
+    channel_id: str,
+    status: str,
+    *,
+    reason: Optional[str],
+    timestamp: Optional[str],
+) -> None:
+    last_error_value = reason
+    if reason is None and status in {"new", "processing"}:
+        last_error_value = ""
+    update_channel_enrichment(
+        channel_id,
+        status=status,
+        status_reason=reason,
+        last_status_change=timestamp,
+        needs_enrichment=None,
+        last_error=last_error_value,
+    )
+
+
+def ensure_channel_url(channel_id: Optional[str], url: Optional[str]) -> str:
+    if url:
+        return url
+    if not channel_id:
+        return ""
+    return f"https://www.youtube.com/channel/{channel_id}"
 
 
 def _build_channel_filters(
@@ -526,7 +584,7 @@ def _build_channel_filters(
     prefix = f"{table_alias}." if table_alias else ""
 
     if filters.query_text:
-        clauses.append(f"({prefix}title LIKE ? OR {prefix}url LIKE ? OR {prefix}emails LIKE ?)")
+        clauses.append(f"({prefix}name LIKE ? OR {prefix}url LIKE ? OR {prefix}emails LIKE ?)")
         term = f"%{filters.query_text}%"
         params.extend([term, term, term])
 
@@ -551,16 +609,12 @@ def _build_channel_filters(
     if filters.emails_only:
         clauses.append(f"({prefix}emails IS NOT NULL AND TRIM({prefix}emails) != '')")
 
-    if not filters.include_archived:
-        clauses.append(f"({prefix}archived IS NULL OR {prefix}archived = 0)")
-
-    clauses.append(f"({prefix}blacklisted IS NULL OR {prefix}blacklisted = 0)")
-
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     return where_clause, params
 
 
 def get_channels(
+    category: ChannelCategory,
     filters: ChannelFilters,
     *,
     sort: str,
@@ -569,7 +623,7 @@ def get_channels(
     offset: int,
 ) -> Tuple[List[Dict[str, Any]], int]:
     valid_sorts = {
-        "title": "title",
+        "name": "name",
         "subscribers": "subscribers",
         "language": "language",
         "last_updated": "last_updated",
@@ -580,10 +634,11 @@ def get_channels(
     sort_column = valid_sorts.get(sort, "created_at")
     order_direction = "DESC" if order.lower() == "desc" else "ASC"
 
+    table = CHANNEL_TABLES[category]
     where_clause, params = _build_channel_filters(filters)
 
     query = (
-        f"SELECT * FROM channels {where_clause} "
+        f"SELECT * FROM {table} {where_clause} "
         f"ORDER BY {sort_column} {order_direction} LIMIT ? OFFSET ?"
     )
     params.extend([limit, offset])
@@ -593,7 +648,7 @@ def get_channels(
         rows = cursor.fetchall()
 
         cursor.execute(
-            f"SELECT COUNT(*) FROM channels {where_clause}",
+            f"SELECT COUNT(*) FROM {table} {where_clause}",
             params[:-2],
         )
         total_row = cursor.fetchone()
@@ -602,19 +657,152 @@ def get_channels(
     items: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        item["archived"] = bool(item.get("archived"))
         items.append(item)
     return items, total
+
+
+def _fetch_channels_by_ids(
+    cursor: sqlite3.Cursor,
+    category: ChannelCategory,
+    channel_ids: Sequence[str],
+) -> List[sqlite3.Row]:
+    if not channel_ids:
+        return []
+    placeholders = ",".join("?" for _ in channel_ids)
+    cursor.execute(
+        f"SELECT * FROM {CHANNEL_TABLES[category]} WHERE channel_id IN ({placeholders})",
+        list(channel_ids),
+    )
+    return cursor.fetchall()
+
+
+def _delete_channels_by_ids(
+    cursor: sqlite3.Cursor,
+    category: ChannelCategory,
+    channel_ids: Sequence[str],
+) -> None:
+    if not channel_ids:
+        return
+    placeholders = ",".join("?" for _ in channel_ids)
+    cursor.execute(
+        f"DELETE FROM {CHANNEL_TABLES[category]} WHERE channel_id IN ({placeholders})",
+        list(channel_ids),
+    )
+
+
+def _move_channels(
+    channel_ids: Sequence[str],
+    source: ChannelCategory,
+    destination: ChannelCategory,
+    *,
+    timestamp: str,
+    status: str,
+    status_reason: str,
+    needs_enrichment: int,
+) -> List[str]:
+    if not channel_ids:
+        return []
+
+    moved: List[str] = []
+    with get_cursor() as cursor:
+        rows = _fetch_channels_by_ids(cursor, source, channel_ids)
+        if not rows:
+            return []
+        for row in rows:
+            data = dict(row)
+            data["status"] = status
+            data["status_reason"] = status_reason
+            data["last_status_change"] = timestamp
+            data["needs_enrichment"] = needs_enrichment
+            _insert_or_replace(cursor, CHANNEL_TABLES[destination], data)
+            moved.append(data["channel_id"])
+        _delete_channels_by_ids(cursor, source, moved)
+    return moved
+
+
+def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[str]:
+    return _move_channels(
+        channel_ids,
+        ChannelCategory.ACTIVE,
+        ChannelCategory.ARCHIVED,
+        timestamp=timestamp,
+        status="archived",
+        status_reason="Archived",
+        needs_enrichment=0,
+    )
+
+
+def restore_channels_by_ids(
+    channel_ids: Sequence[str],
+    timestamp: str,
+    *,
+    source_categories: Optional[Sequence[ChannelCategory]] = None,
+) -> List[str]:
+    if not channel_ids:
+        return []
+    categories = list(source_categories) if source_categories else [
+        ChannelCategory.ARCHIVED,
+        ChannelCategory.BLACKLISTED,
+    ]
+    restored: List[str] = []
+    remaining = list(channel_ids)
+    for category in categories:
+        if not remaining:
+            break
+        moved = _move_channels(
+            remaining,
+            category,
+            ChannelCategory.ACTIVE,
+            timestamp=timestamp,
+            status="new",
+            status_reason="Restored",
+            needs_enrichment=1,
+        )
+        restored.extend(moved)
+        remaining = [cid for cid in remaining if cid not in moved]
+    return restored
+
+
+def blacklist_channels_by_ids(
+    channel_ids: Sequence[str],
+    timestamp: str,
+    *,
+    source_categories: Optional[Sequence[ChannelCategory]] = None,
+) -> List[str]:
+    if not channel_ids:
+        return []
+    categories = list(source_categories) if source_categories else [
+        ChannelCategory.ACTIVE,
+        ChannelCategory.ARCHIVED,
+    ]
+    blacklisted: List[str] = []
+    remaining = list(channel_ids)
+    for category in categories:
+        if not remaining:
+            break
+        moved = _move_channels(
+            remaining,
+            category,
+            ChannelCategory.BLACKLISTED,
+            timestamp=timestamp,
+            status="blacklisted",
+            status_reason="Blacklisted",
+            needs_enrichment=0,
+        )
+        blacklisted.extend(moved)
+        remaining = [cid for cid in remaining if cid not in moved]
+    for cid in blacklisted:
+        ensure_blacklisted_channel(cid, timestamp)
+    return blacklisted
 
 
 def get_pending_channels(limit: Optional[int]) -> List[Dict[str, Any]]:
     limit_clause = "LIMIT ?" if limit is not None else ""
     params: Tuple[Any, ...] = (limit,) if limit is not None else tuple()
+    table = CHANNEL_TABLES[ChannelCategory.ACTIVE]
     query = (
-        "SELECT * FROM channels WHERE status IN ('new', 'error') "
-        "AND (archived IS NULL OR archived = 0) "
-        "AND (blacklisted IS NULL OR blacklisted = 0) "
-        "ORDER BY last_attempted IS NULL DESC, last_attempted ASC "
+        f"SELECT * FROM {table} WHERE status IN ('new', 'error') "
+        f"ORDER BY last_attempted IS NULL DESC, last_attempted ASC "
         + limit_clause
     )
     with get_cursor() as cursor:
@@ -625,10 +813,10 @@ def get_pending_channels(limit: Optional[int]) -> List[Dict[str, Any]]:
 def get_channels_for_email_enrichment(limit: Optional[int]) -> List[Dict[str, Any]]:
     limit_clause = "LIMIT ?" if limit is not None else ""
     params: Tuple[Any, ...] = (limit,) if limit is not None else tuple()
+    table = CHANNEL_TABLES[ChannelCategory.ACTIVE]
     query = (
-        "SELECT * FROM channels WHERE (archived IS NULL OR archived = 0) "
-        "AND (blacklisted IS NULL OR blacklisted = 0) "
-        "ORDER BY last_updated IS NULL DESC, last_updated ASC "
+        f"SELECT * FROM {table} "
+        f"ORDER BY last_updated IS NULL DESC, last_updated ASC "
         + limit_clause
     )
     with get_cursor() as cursor:
@@ -636,54 +824,17 @@ def get_channels_for_email_enrichment(limit: Optional[int]) -> List[Dict[str, An
         return [dict(row) for row in cursor.fetchall()]
 
 
-def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[str]:
-    if not channel_ids:
-        return []
-
-    placeholders = ",".join("?" for _ in channel_ids)
-    params: List[Any] = list(channel_ids)
-
+def get_channel_totals() -> Dict[str, int]:
+    totals: Dict[str, int] = {}
     with get_cursor() as cursor:
-        cursor.execute(
-            f"SELECT channel_id FROM channels WHERE channel_id IN ({placeholders}) "
-            "AND (archived IS NULL OR archived = 0) "
-            "AND (blacklisted IS NULL OR blacklisted = 0)",
-            params,
-        )
-        targets = [row[0] for row in cursor.fetchall()]
-        if not targets:
-            return []
-
-        target_placeholders = ",".join("?" for _ in targets)
-        cursor.execute(
-            f"UPDATE channels SET archived = 1, archived_at = ?, needs_enrichment = 0 "
-            f"WHERE channel_id IN ({target_placeholders})",
-            [timestamp, *targets],
-        )
-        return targets
-
-
-def archive_or_create_channel(channel_id: str, timestamp: str) -> Tuple[bool, bool]:
-    """Mark a channel as blacklisted, creating a placeholder if required."""
-
-    return upsert_blacklist_channel(channel_id, timestamp)
-
-
-def set_channel_status(channel_id: str, status: str, *, reason: Optional[str], timestamp: Optional[str]) -> None:
-    last_error_value = reason
-    if reason is None and status in {"new", "processing"}:
-        last_error_value = ""
-    update_channel_enrichment(
-        channel_id,
-        status=status,
-        status_reason=reason,
-        last_status_change=timestamp,
-        needs_enrichment=None,
-        last_error=last_error_value,
-    )
-
-
-def ensure_channel_url(channel_id: str, url: Optional[str]) -> str:
-    if url:
-        return url
-    return f"https://www.youtube.com/channel/{channel_id}"
+        for category in ChannelCategory:
+            cursor.execute(
+                f"SELECT COUNT(*) AS count FROM {CHANNEL_TABLES[category]}",
+            )
+            row = cursor.fetchone()
+            totals[category.value] = row["count"] if row and row["count"] is not None else 0
+        cursor.execute("SELECT COUNT(*) AS count FROM emails_unique")
+        email_row = cursor.fetchone()
+        totals["unique_emails"] = email_row["count"] if email_row and email_row["count"] is not None else 0
+    totals["total"] = totals.get(ChannelCategory.ACTIVE.value, 0)
+    return totals

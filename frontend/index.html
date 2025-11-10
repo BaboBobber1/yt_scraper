@@ -7,139 +7,168 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <div class="container">
-      <header>
-        <h1>Crypto YouTube Harvester</h1>
-        <p>Discover, enrich and export crypto-focused YouTube channels.</p>
+    <div class="app" id="app">
+      <header class="app-header">
+        <div>
+          <h1>Crypto YouTube Harvester</h1>
+          <p class="app-tagline">Organize, filter and manage outreach-ready channels.</p>
+        </div>
+        <div class="quick-stats" id="quickStats">
+          <span class="quick-stats__loading">Loading stats…</span>
+        </div>
       </header>
 
-      <section class="controls">
-        <div class="field">
-          <label for="keywords">Keywords</label>
-          <textarea id="keywords" rows="4">crypto, bitcoin, ethereum, defi, altcoin, memecoin, onchain, crypto trading</textarea>
+      <section class="discover-panel">
+        <div class="discover-grid">
+          <div class="discover-field">
+            <label for="discoverKeywords">Discovery keywords</label>
+            <textarea
+              id="discoverKeywords"
+              rows="4"
+              spellcheck="false"
+            >crypto, bitcoin, ethereum, defi, altcoin, memecoin, onchain, crypto trading</textarea>
+          </div>
+          <div class="discover-field discover-field--small">
+            <label for="discoverPerKeyword">Per keyword</label>
+            <input type="number" id="discoverPerKeyword" min="1" value="5" />
+            <label for="enrichLimit">Enrich limit (optional)</label>
+            <input type="number" id="enrichLimit" min="1" placeholder="No limit" />
+          </div>
         </div>
-        <div class="field inline">
-          <label for="perKeyword">Per keyword</label>
-          <input type="number" id="perKeyword" min="1" value="5" />
+        <div class="discover-actions">
+          <button class="btn btn--green" id="discoverBtn"><span class="btn-icon">🔍</span>Discover</button>
+          <button class="btn btn--green" id="enrichBtn"><span class="btn-icon">⚙️</span>Enrich</button>
+          <button class="btn btn--green" id="enrichEmailBtn"><span class="btn-icon">✉️</span>Enrich (Email-only)</button>
+          <button class="btn btn--green" id="exportCsvBtn"><span class="btn-icon">⬇️</span>Export CSV</button>
+          <button class="btn btn--green" id="importBlacklistBtn"><span class="btn-icon">📥</span>Import blacklist (CSV)</button>
         </div>
-        <div class="buttons">
-          <button id="discoverBtn">Discover</button>
-          <button id="enrichBtn">Enrich</button>
-          <button id="enrichEmailBtn">Enrich (Email-only)</button>
-          <button id="exportBtn">Export CSV</button>
-          <button id="importBlacklistBtn" class="ghost-button">Import blacklist (CSV)</button>
+        <div class="status-container">
+          <div class="status-bar" id="statusBar" hidden></div>
+          <div class="status-bar status-bar--info" id="progressBar" hidden></div>
+          <div class="status-bar" id="summaryBar" hidden></div>
         </div>
-        <div class="status" id="status"></div>
-        <div class="progress" id="progress"></div>
-        <div class="summary" id="batchSummary"></div>
-        <div class="stats" id="statsSummary"></div>
       </section>
 
-      <section class="table-section">
-        <div class="list-toolbar">
-          <div class="toggle-group">
-            <label class="toggle">
-              <input type="checkbox" id="emailsToggle" />
-              <span>Only emails</span>
-            </label>
-            <label class="toggle">
-              <input type="checkbox" id="uniqueEmailsToggle" />
-              <span>Unique emails</span>
-            </label>
-            <label class="toggle">
-              <input type="checkbox" id="hideArchivedToggle" checked />
-              <span>Hide archived</span>
-            </label>
+      <nav class="tab-navigation">
+        <button class="tab is-active" data-category="active">Active</button>
+        <button class="tab" data-category="archived">Archived</button>
+        <button class="tab" data-category="blacklisted">Blacklisted</button>
+      </nav>
+
+      <section class="filters">
+        <div class="filter-grid">
+          <div class="filter-field">
+            <label for="filterQuery">Search</label>
+            <input type="text" id="filterQuery" placeholder="Name, URL, email" />
           </div>
-          <button id="archiveAllBtn" class="ghost-button">Archive all (current filter)</button>
-        </div>
-        <div class="filters-grid">
-          <div class="field">
-            <label for="search">Search</label>
-            <input type="text" id="search" placeholder="Free text (title, url, email)" />
+          <div class="filter-field">
+            <label for="filterLanguages">Languages</label>
+            <input type="text" id="filterLanguages" placeholder="e.g. en, de, es" />
           </div>
-          <div class="field">
-            <label for="languageFilter">Languages</label>
-            <input type="text" id="languageFilter" placeholder="e.g. en,de" />
-          </div>
-          <div class="field range-field">
+          <div class="filter-field filter-field--range">
             <label>Subscribers</label>
             <div class="range-inputs">
-              <input type="number" id="minSubs" placeholder="min" min="0" />
+              <input type="number" id="filterMinSubs" placeholder="Min" min="0" />
               <span>–</span>
-              <input type="number" id="maxSubs" placeholder="max" min="0" />
+              <input type="number" id="filterMaxSubs" placeholder="Max" min="0" />
             </div>
           </div>
-          <div class="field status-field">
-            <span>Status</span>
-            <div class="status-options">
-              <label><input type="checkbox" value="new" /> New</label>
-              <label><input type="checkbox" value="processing" /> Processing</label>
-              <label><input type="checkbox" value="completed" /> Completed</label>
-              <label><input type="checkbox" value="error" /> Error</label>
+          <fieldset class="filter-field filter-field--status">
+            <legend>Status</legend>
+            <div class="status-grid">
+              <label class="status-option"><input type="checkbox" name="statusFilter" value="new" /> New</label>
+              <label class="status-option"><input type="checkbox" name="statusFilter" value="processing" /> Processing</label>
+              <label class="status-option"><input type="checkbox" name="statusFilter" value="completed" /> Completed</label>
+              <label class="status-option"><input type="checkbox" name="statusFilter" value="error" /> Error</label>
             </div>
+          </fieldset>
+        </div>
+        <div class="filter-toggles">
+          <label class="filter-toggle"><input type="checkbox" id="filterEmailsOnly" /> Emails only</label>
+          <label class="filter-toggle"><input type="checkbox" id="filterUniqueEmails" disabled /> Unique emails</label>
+        </div>
+      </section>
+
+      <section class="table-panel">
+        <div class="table-header">
+          <div>
+            <h2 id="tableTitle">Active channels</h2>
+            <p class="table-subtitle" id="tableSubtitle">Fresh leads waiting for outreach.</p>
           </div>
-          <div class="field small">
-            <label for="sort">Sort</label>
-            <select id="sort">
+          <div class="header-actions">
+            <button class="btn btn--yellow" id="bulkPrimaryBtn">🟡 Archive (filtered)</button>
+            <button class="btn btn--red" id="bulkSecondaryBtn">🔴 Blacklist (filtered)</button>
+          </div>
+        </div>
+        <div class="table-toolbar">
+          <div class="table-sort">
+            <label for="sortSelect">Sort</label>
+            <select id="sortSelect">
               <option value="created_at">Newest</option>
-              <option value="title">Name</option>
+              <option value="name">Name</option>
               <option value="subscribers">Subscribers</option>
               <option value="language">Language</option>
               <option value="last_updated">Last updated</option>
               <option value="status">Status</option>
               <option value="last_status_change">Status change</option>
             </select>
-          </div>
-          <div class="field small">
-            <label for="order">Order</label>
-            <select id="order">
+            <label for="orderSelect">Order</label>
+            <select id="orderSelect">
               <option value="desc">Descending</option>
               <option value="asc">Ascending</option>
             </select>
           </div>
+          <div class="table-meta" id="tableStatus"></div>
         </div>
-        <table id="channelsTable">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Link</th>
-              <th>Subscribers</th>
-              <th>Language</th>
-              <th>Emails</th>
-              <th>Status</th>
-              <th>Last updated</th>
-              <th>Error</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Subscribers</th>
+                <th>Language</th>
+                <th>Emails</th>
+                <th>Status</th>
+                <th>Last updated</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody">
+              <tr>
+                <td colspan="7" class="table-loading">Loading channels…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
         <div class="pagination">
-          <button id="prevPage">Previous</button>
-          <span id="pageInfo"></span>
-          <button id="nextPage">Next</button>
+          <button class="btn btn--outline" id="prevPageBtn">← Previous</button>
+          <span id="paginationLabel">Page 1 of 1</span>
+          <button class="btn btn--outline" id="nextPageBtn">Next →</button>
         </div>
       </section>
     </div>
-    <div class="modal" id="blacklistModal" aria-hidden="true">
+
+    <div class="modal" id="blacklistModal" hidden>
       <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="blacklistTitle">
-        <button type="button" class="modal-close" id="blacklistCloseBtn" aria-label="Close">×</button>
-        <h2 id="blacklistTitle">Import blacklist</h2>
-        <form id="blacklistForm">
-          <div class="field">
+        <div class="modal-header">
+          <h2 id="blacklistTitle">Import blacklist</h2>
+          <button type="button" class="modal-close" id="blacklistCloseBtn" aria-label="Close">×</button>
+        </div>
+        <form class="modal-body" id="blacklistForm">
+          <div class="modal-field">
             <label for="blacklistFile">CSV file</label>
             <input type="file" id="blacklistFile" accept=".csv,text/csv" required />
-            <p class="modal-note">Accepted columns: <code>channel_id</code> or <code>url</code>. Additional columns are ignored.</p>
+            <p class="modal-hint">Accepted columns: <code>channel_id</code> or <code>url</code>. Additional columns are ignored.</p>
           </div>
           <div class="modal-actions">
-            <button type="submit" id="blacklistSubmitBtn">Import</button>
-            <button type="button" class="ghost-button" id="blacklistCancelBtn">Cancel</button>
+            <button type="submit" class="btn btn--red" id="blacklistSubmitBtn">Import</button>
+            <button type="button" class="btn btn--outline" id="blacklistCancelBtn">Cancel</button>
           </div>
         </form>
-        <div class="modal-status" id="blacklistSummary"></div>
+        <div class="modal-summary" id="blacklistSummary"></div>
       </div>
     </div>
-    <script src="/static/script.js"></script>
+
+    <script type="module" src="/static/app.js"></script>
   </body>
 </html>
