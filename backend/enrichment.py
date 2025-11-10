@@ -202,7 +202,10 @@ class EnrichmentManager:
             return
 
         success_time = dt.datetime.utcnow().isoformat()
-        emails = ", ".join(enriched.get("emails", [])) if enriched.get("emails") else None
+        enriched_emails = enriched.get("emails") or []
+        if enriched_emails:
+            database.record_channel_emails(channel_id, enriched_emails, success_time)
+        emails = ", ".join(enriched_emails) if enriched_emails else None
         database.update_channel_enrichment(
             channel_id,
             title=enriched.get("title") or channel.get("title"),
@@ -230,7 +233,7 @@ class EnrichmentManager:
                 "subscribers": enriched.get("subscribers"),
                 "language": enriched.get("language"),
                 "languageConfidence": enriched.get("language_confidence"),
-                "emails": enriched.get("emails", []),
+                "emails": enriched_emails,
                 "lastUpdated": enriched.get("last_updated") or success_time,
                 "mode": job.mode,
             }
@@ -242,6 +245,39 @@ class EnrichmentManager:
     def _process_channel_email_only(self, job: EnrichmentJob, channel: Dict) -> None:
         channel_id = channel["channel_id"]
         start_time = dt.datetime.utcnow().isoformat()
+
+        parsed_emails = database.parse_email_candidates(channel.get("emails"))
+        stored_emails = database.get_channel_email_set(channel_id)
+        display_emails: List[str] = list(parsed_emails)
+        if not display_emails and stored_emails:
+            display_emails = sorted(stored_emails)
+        should_skip = bool(stored_emails)
+        if not should_skip and display_emails:
+            should_skip = database.has_all_known_emails(display_emails)
+        if should_skip:
+            if display_emails:
+                database.record_channel_emails(channel_id, display_emails, start_time)
+            elif stored_emails:
+                database.record_channel_emails(channel_id, stored_emails, start_time)
+            emails_value = ", ".join(display_emails) if display_emails else channel.get("emails")
+            if emails_value:
+                database.update_channel_enrichment(channel_id, emails=emails_value)
+            job.update_counts(completed=True)
+            job.push_update(
+                {
+                    "type": "channel",
+                    "channelId": channel_id,
+                    "status": "completed",
+                    "statusReason": "emails unchanged",
+                    "lastStatusChange": start_time,
+                    "emails": display_emails,
+                    "lastUpdated": channel.get("last_updated") or start_time,
+                    "mode": job.mode,
+                }
+            )
+            if job.completed + job.errors >= job.total:
+                job.mark_done()
+            return
 
         job.push_update(
             {
@@ -293,6 +329,8 @@ class EnrichmentManager:
 
         success_time = dt.datetime.utcnow().isoformat()
         emails = enriched.get("emails") or []
+        if emails:
+            database.record_channel_emails(channel_id, emails, success_time)
         emails_value = ", ".join(emails) if emails else None
         last_updated = enriched.get("last_updated") or success_time
         database.update_channel_enrichment(
