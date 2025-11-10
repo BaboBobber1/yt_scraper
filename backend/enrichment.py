@@ -206,6 +206,7 @@ class EnrichmentManager:
         if enriched_emails:
             database.record_channel_emails(channel_id, enriched_emails, success_time)
         emails = ", ".join(enriched_emails) if enriched_emails else None
+        email_gate_present = enriched.get("email_gate_present")
         database.update_channel_enrichment(
             channel_id,
             name=enriched.get("name") or enriched.get("title") or channel.get("name") or channel.get("title"),
@@ -213,6 +214,7 @@ class EnrichmentManager:
             language=enriched.get("language"),
             language_confidence=enriched.get("language_confidence"),
             emails=emails,
+            email_gate_present=email_gate_present,
             last_updated=enriched.get("last_updated") or success_time,
             last_attempted=success_time,
             needs_enrichment=False,
@@ -235,6 +237,7 @@ class EnrichmentManager:
                 "languageConfidence": enriched.get("language_confidence"),
                 "emails": enriched_emails,
                 "lastUpdated": enriched.get("last_updated") or success_time,
+                "emailGatePresent": email_gate_present,
                 "mode": job.mode,
             }
         )
@@ -261,7 +264,11 @@ class EnrichmentManager:
                 database.record_channel_emails(channel_id, stored_emails, start_time)
             emails_value = ", ".join(display_emails) if display_emails else channel.get("emails")
             if emails_value:
-                database.update_channel_enrichment(channel_id, emails=emails_value)
+                database.update_channel_enrichment(
+                    channel_id,
+                    emails=emails_value,
+                    email_gate_present=False,
+                )
             job.update_counts(completed=True)
             job.push_update(
                 {
@@ -272,6 +279,7 @@ class EnrichmentManager:
                     "lastStatusChange": start_time,
                     "emails": display_emails,
                     "lastUpdated": channel.get("last_updated") or start_time,
+                    "emailGatePresent": False,
                     "mode": job.mode,
                 }
             )
@@ -333,10 +341,12 @@ class EnrichmentManager:
             database.record_channel_emails(channel_id, emails, success_time)
         emails_value = ", ".join(emails) if emails else None
         last_updated = enriched.get("last_updated") or success_time
+        email_gate_present = enriched.get("email_gate_present")
         database.update_channel_enrichment(
             channel_id,
             emails=emails_value,
             last_updated=last_updated,
+            email_gate_present=email_gate_present,
         )
 
         job.update_counts(completed=True)
@@ -349,6 +359,7 @@ class EnrichmentManager:
                 "lastStatusChange": success_time,
                 "emails": emails,
                 "lastUpdated": last_updated,
+                "emailGatePresent": email_gate_present,
                 "mode": job.mode,
             }
         )

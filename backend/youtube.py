@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
@@ -603,7 +603,7 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
     if feed_description:
         emails.extend(extract_emails([feed_description]))
     # Deduplicate again after combining feed and watch descriptions.
-    unique_emails = []
+    unique_emails: List[str] = []
     seen = set()
     for email in emails:
         lower = email.lower()
@@ -613,6 +613,15 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
         if len(unique_emails) >= 5:
             break
 
+    email_gate_present: Optional[bool] = False if unique_emails else None
+    if not unique_emails:
+        about_emails, gate_present = _fetch_about_emails(channel)
+        if about_emails:
+            unique_emails = about_emails
+            email_gate_present = False
+        else:
+            email_gate_present = gate_present
+
     return {
         "name": feed_title or channel.get("name") or channel.get("title"),
         "subscribers": watch.get("subscribers"),
@@ -620,6 +629,7 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
         "language_confidence": lang_result["confidence"] if lang_result else None,
         "emails": unique_emails,
         "last_updated": watch.get("upload_date") or video.get("timestamp"),
+        "email_gate_present": email_gate_present,
     }
 
 
@@ -636,7 +646,9 @@ def _resolve_about_url(channel: Dict[str, Optional[str]]) -> str:
     return f"https://www.youtube.com/channel/{channel_id}/about"
 
 
-def _fetch_about_emails(channel: Dict[str, Optional[str]], timeout: int = 5) -> List[str]:
+def _fetch_about_emails(
+    channel: Dict[str, Optional[str]], timeout: int = 5
+) -> Tuple[List[str], bool]:
     about_url = _resolve_about_url(channel)
     RATE_LIMITER.wait()
     try:
@@ -644,9 +656,24 @@ def _fetch_about_emails(channel: Dict[str, Optional[str]], timeout: int = 5) -> 
     except requests.RequestException as exc:  # pragma: no cover - network errors
         raise EnrichmentError(f"Failed to load channel about page: {exc}")
     if response.status_code == 404:
-        return []
+        return [], False
     response.raise_for_status()
-    return extract_emails([html.unescape(response.text)])
+    page_text = html.unescape(response.text)
+    found_emails = extract_emails([page_text])
+    unique_emails: List[str] = []
+    seen: Set[str] = set()
+    for email in found_emails:
+        lower = email.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        unique_emails.append(email)
+        if len(unique_emails) >= 5:
+            break
+    gate_present = False
+    if not unique_emails and "view email address" in page_text.lower():
+        gate_present = True
+    return unique_emails, gate_present
 
 
 def _fetch_latest_video_metadata(channel_id: str) -> Optional[Dict[str, Optional[str]]]:
@@ -680,9 +707,11 @@ def enrich_channel_email_only(channel: Dict[str, Optional[str]]) -> Dict[str, Op
 
     emails: List[str] = []
 
-    about_emails = _fetch_about_emails(channel)
+    about_emails, about_gate = _fetch_about_emails(channel)
+    email_gate_present: Optional[bool] = about_gate
     if about_emails:
         emails.extend(about_emails)
+        email_gate_present = False
 
     video = _fetch_latest_video_metadata(channel_id)
     last_updated = None
@@ -705,4 +734,11 @@ def enrich_channel_email_only(channel: Dict[str, Optional[str]]) -> Dict[str, Op
     if not last_updated:
         last_updated = dt.datetime.utcnow().isoformat()
 
-    return {"emails": unique_emails, "last_updated": last_updated}
+    if unique_emails:
+        email_gate_present = False
+
+    return {
+        "emails": unique_emails,
+        "last_updated": last_updated,
+        "email_gate_present": email_gate_present,
+    }
