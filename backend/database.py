@@ -233,11 +233,21 @@ def is_blacklisted(channel_id: str) -> bool:
         return cursor.fetchone() is not None
 
 
-def ensure_blacklisted_channel(channel_id: str, timestamp: str) -> Tuple[bool, bool]:
+def ensure_blacklisted_channel(
+    channel_id: str,
+    timestamp: str,
+    *,
+    url: Optional[str] = None,
+    name: Optional[str] = None,
+) -> Tuple[bool, bool]:
     """Ensure a record exists for the channel in the blacklist tables."""
 
     created = False
     updated = False
+    canonical_url = ensure_channel_url(channel_id, url)
+    resolved_name = name.strip() if isinstance(name, str) else name
+    if resolved_name == "":
+        resolved_name = None
 
     with get_cursor() as cursor:
         cursor.execute(
@@ -265,8 +275,8 @@ def ensure_blacklisted_channel(channel_id: str, timestamp: str) -> Tuple[bool, b
         if existing is None:
             payload = {
                 "channel_id": channel_id,
-                "name": None,
-                "url": ensure_channel_url(channel_id, None),
+                "name": resolved_name,
+                "url": canonical_url,
                 "subscribers": None,
                 "language": None,
                 "language_confidence": None,
@@ -280,7 +290,17 @@ def ensure_blacklisted_channel(channel_id: str, timestamp: str) -> Tuple[bool, b
                 "status_reason": "Blacklisted",
                 "last_status_change": timestamp,
             }
-            _insert_or_replace(cursor, CHANNEL_TABLES[ChannelCategory.BLACKLISTED], payload)
+        else:
+            payload = dict(existing)
+            payload.update(
+                name=resolved_name or existing["name"],
+                url=canonical_url,
+                needs_enrichment=0,
+                status="blacklisted",
+                status_reason="Blacklisted",
+                last_status_change=existing["last_status_change"] or timestamp,
+            )
+        _insert_or_replace(cursor, CHANNEL_TABLES[ChannelCategory.BLACKLISTED], payload)
         return updated, created
 
 
