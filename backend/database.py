@@ -60,6 +60,7 @@ CHANNEL_COLUMNS = [
     "language",
     "language_confidence",
     "emails",
+    "email_gate_present",
     "last_updated",
     "created_at",
     "last_attempted",
@@ -71,6 +72,13 @@ CHANNEL_COLUMNS = [
 ]
 
 LEGACY_TABLE = "channels"
+
+
+def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = {row["name"] for row in cursor.fetchall()}
+    if column not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db() -> None:
@@ -87,6 +95,7 @@ def init_db() -> None:
                     language TEXT,
                     language_confidence REAL,
                     emails TEXT,
+                    email_gate_present INTEGER,
                     last_updated TEXT,
                     created_at TEXT NOT NULL,
                     last_attempted TEXT,
@@ -98,6 +107,7 @@ def init_db() -> None:
                 )
                 """
             )
+            _ensure_column(cursor, table, "email_gate_present", "INTEGER")
 
         cursor.execute(
             """
@@ -199,6 +209,7 @@ class ChannelFilters:
     max_subscribers: Optional[int] = None
     emails_only: bool = False
     include_archived: bool = False
+    email_gate_only: bool = False
 
 
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -312,6 +323,12 @@ def _prepare_channel_payload(channel: Dict[str, Any]) -> Dict[str, Any]:
             if value is None:
                 value = 1
             payload[column] = int(bool(value))
+        elif column == "email_gate_present":
+            value = channel.get(column)
+            if value is None or value == "":
+                payload[column] = None
+            else:
+                payload[column] = int(bool(value))
         else:
             payload[column] = channel.get(column)
     if payload.get("name") is None:
@@ -516,6 +533,7 @@ def update_channel_enrichment(
     language: Optional[str] = None,
     language_confidence: Optional[float] = None,
     emails: Optional[str] = None,
+    email_gate_present: Optional[bool] = None,
     last_updated: Optional[str] = None,
     last_attempted: Optional[str] = None,
     needs_enrichment: Optional[bool] = None,
@@ -535,6 +553,8 @@ def update_channel_enrichment(
         updates["language_confidence"] = language_confidence
     if emails is not None:
         updates["emails"] = emails
+    if email_gate_present is not None:
+        updates["email_gate_present"] = int(bool(email_gate_present))
     if last_updated is not None:
         updates["last_updated"] = last_updated
     if last_attempted is not None:
@@ -628,6 +648,9 @@ def _build_channel_filters(
 
     if filters.emails_only:
         clauses.append(f"({prefix}emails IS NOT NULL AND TRIM({prefix}emails) != '')")
+
+    if filters.email_gate_only:
+        clauses.append(f"{prefix}email_gate_present = 1")
 
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     return where_clause, params

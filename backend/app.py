@@ -73,6 +73,7 @@ def _collect_filters(
     max_subscribers: Optional[str],
     emails_only: bool,
     include_archived: bool,
+    email_gate_only: bool,
 ) -> ChannelFilters:
     language_values = [value.lower() for value in _parse_multi(languages) or []] or None
     status_values = [value.lower() for value in _parse_multi(statuses) or []] or None
@@ -99,6 +100,7 @@ def _collect_filters(
         max_subscribers=max_subs_int,
         emails_only=emails_only,
         include_archived=include_archived,
+        email_gate_only=email_gate_only,
     )
 
 
@@ -386,6 +388,7 @@ def api_channels(
     offset: int = Query(default=0, ge=0),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    email_gate_only: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -397,6 +400,7 @@ def api_channels(
         max_subscribers=max_subscribers,
         emails_only=emails_only,
         include_archived=include_archived,
+        email_gate_only=email_gate_only,
     )
     items, total = database.get_channels(
         category_value,
@@ -432,6 +436,7 @@ def api_archive_bulk(
     offset: int = Query(default=0, ge=0),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    email_gate_only: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -459,6 +464,7 @@ def api_archive_bulk(
             max_subscribers=max_subscribers,
             emails_only=emails_only,
             include_archived=include_archived,
+            email_gate_only=email_gate_only,
         )
         items, _ = database.get_channels(
             category_value,
@@ -510,6 +516,7 @@ def api_blacklist_bulk(
     offset: int = Query(default=0, ge=0),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    email_gate_only: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -533,6 +540,7 @@ def api_blacklist_bulk(
             max_subscribers=max_subscribers,
             emails_only=emails_only,
             include_archived=include_archived,
+            email_gate_only=email_gate_only,
         )
         items, _ = database.get_channels(
             category_value,
@@ -583,6 +591,7 @@ def api_restore_bulk(
     offset: int = Query(default=0, ge=0),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    email_gate_only: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ARCHIVED.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -608,6 +617,7 @@ def api_restore_bulk(
             max_subscribers=max_subscribers,
             emails_only=emails_only,
             include_archived=include_archived,
+            email_gate_only=email_gate_only,
         )
         items, _ = database.get_channels(
             category_value,
@@ -636,6 +646,7 @@ def api_export_csv(
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
     unique_emails: bool = Query(default=False),
+    email_gate_only: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> PlainTextResponse:
     category_value = _parse_category(category)
@@ -647,6 +658,7 @@ def api_export_csv(
         max_subscribers=max_subscribers,
         emails_only=emails_only,
         include_archived=include_archived,
+        email_gate_only=email_gate_only,
     )
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -688,6 +700,7 @@ def api_export_csv(
                 "Subscribers",
                 "Language",
                 "Emails",
+                "Email Gate",
                 "Status",
                 "Last Updated",
                 "Last Status Change",
@@ -704,6 +717,9 @@ def api_export_csv(
                     item.get("subscribers") or "",
                     item.get("language") or "",
                     item.get("emails") or "",
+                    "Yes"
+                    if item.get("email_gate_present")
+                    else ("No" if item.get("email_gate_present") == 0 else ""),
                     item.get("status") or "",
                     item.get("last_updated") or "",
                     item.get("last_status_change") or "",

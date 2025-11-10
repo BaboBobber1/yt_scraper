@@ -411,6 +411,28 @@ a:hover {
   word-break: break-all;
 }
 
+.name-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
+.badge--gate {
+  background: rgba(77, 164, 255, 0.2);
+  color: #acd4ff;
+}
+
 .emails-cell {
   max-width: 220px;
   white-space: pre-wrap;

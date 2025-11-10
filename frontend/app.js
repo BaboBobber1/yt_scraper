@@ -73,6 +73,7 @@ function defaultFilters() {
     maxSubscribers: '',
     emailsOnly: false,
     uniqueEmails: false,
+    emailGateOnly: false,
   };
 }
 
@@ -232,6 +233,7 @@ class Dashboard {
       filterMaxSubs: this.root.querySelector('#filterMaxSubs'),
       filterEmailsOnly: this.root.querySelector('#filterEmailsOnly'),
       filterUniqueEmails: this.root.querySelector('#filterUniqueEmails'),
+      filterEmailGateOnly: this.root.querySelector('#filterEmailGateOnly'),
       filterStatusCheckboxes: Array.from(this.root.querySelectorAll('input[name="statusFilter"]')),
     };
   }
@@ -272,6 +274,7 @@ class Dashboard {
       scheduleFilters();
     });
     this.el.filterUniqueEmails.addEventListener('change', scheduleFilters);
+    this.el.filterEmailGateOnly.addEventListener('change', scheduleFilters);
     this.el.filterStatusCheckboxes.forEach((checkbox) => {
       checkbox.addEventListener('change', scheduleFilters);
     });
@@ -342,6 +345,7 @@ class Dashboard {
     this.el.filterEmailsOnly.checked = Boolean(filters.emailsOnly);
     this.el.filterUniqueEmails.checked = Boolean(filters.uniqueEmails);
     this.el.filterUniqueEmails.disabled = !filters.emailsOnly;
+    this.el.filterEmailGateOnly.checked = Boolean(filters.emailGateOnly);
     this.el.filterStatusCheckboxes.forEach((checkbox) => {
       checkbox.checked = filters.statuses.includes(checkbox.value);
     });
@@ -601,12 +605,17 @@ class Dashboard {
     const channelId = escapeHtml(row.channel_id);
     const emails = row.emails ? escapeHtml(row.emails) : '—';
     const reason = statusReason ? escapeHtml(statusReason) : '';
+    const emailGate = Boolean(row.email_gate_present);
+    const badgesHtml = emailGate
+      ? '<div class="name-badges"><span class="badge badge--gate">🔒 Email gate</span></div>'
+      : '';
 
     return `
       <tr>
         <td class="name-cell">
           <span class="name-primary">${name}</span>
           <a class="name-link" href="${url}" target="_blank" rel="noopener noreferrer">${channelId}</a>
+          ${badgesHtml}
         </td>
         <td>${subscribers}</td>
         <td>${language}</td>
@@ -638,6 +647,7 @@ class Dashboard {
       maxSubscribers: this.el.filterMaxSubs.value ? Number(this.el.filterMaxSubs.value) : '',
       emailsOnly: this.el.filterEmailsOnly.checked,
       uniqueEmails: this.el.filterUniqueEmails.checked,
+      emailGateOnly: this.el.filterEmailGateOnly.checked,
       statuses: this.el.filterStatusCheckboxes.filter((c) => c.checked).map((c) => c.value),
     };
     this.tables[this.activeTab].filters = filters;
