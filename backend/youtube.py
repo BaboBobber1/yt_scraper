@@ -31,32 +31,92 @@ SESSION.headers.update(
 )
 
 CHANNEL_ID_PATTERN = re.compile(r"(UC[\w-]{22})", re.IGNORECASE)
+HYPERLINK_RE = re.compile(r"=HYPERLINK\(\s*([\"'])([^\"']+?)\1", re.IGNORECASE)
+HANDLE_PATTERN = re.compile(r"@([A-Za-z0-9._-]{3,})$")
 
 
 def _normalize_candidate(value: str) -> str:
-    cleaned = value.strip()
+    if value is None:
+        return ""
+    cleaned = str(value).strip()
     if not cleaned:
         return ""
-    cleaned = cleaned.split("?")[0].rstrip("/")
-    return cleaned
+    match = HYPERLINK_RE.search(cleaned)
+    if match:
+        cleaned = match.group(2).strip()
+    cleaned = cleaned.replace("\ufeff", "")
+    cleaned = (
+        cleaned.replace("\u200b", "")
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+        .replace("\u200e", "")
+        .replace("\u200f", "")
+    )
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable())
+    cleaned = cleaned.strip()
+    cleaned = cleaned.strip("<>\"'()")
+    if not cleaned:
+        return ""
+    cleaned = cleaned.splitlines()[0].strip()
+    if " " in cleaned:
+        candidate, _, _ = cleaned.partition(" ")
+        if candidate:
+            cleaned = candidate
+    cleaned = cleaned.rstrip(",;)")
+    cleaned = cleaned.split("#", 1)[0]
+    cleaned = cleaned.split("?", 1)[0]
+    return cleaned.rstrip("/")
+
+
+def sanitize_channel_input(value: Optional[str]) -> str:
+    """Public helper returning a cleaned channel reference candidate."""
+
+    return _normalize_candidate(value)
+
+
+def _normalize_path(path: str) -> str:
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return "/"
+    first = segments[0]
+    if first.lower() == "channel" and len(segments) > 1:
+        return f"/channel/{segments[1].upper()}"
+    if first.startswith("@"):
+        return f"/{first}"
+    if first.lower() in {"c", "user"} and len(segments) > 1:
+        return f"/{first}/{segments[1]}"
+    return f"/{first}"
 
 
 def _ensure_absolute_url(value: str) -> Optional[str]:
     candidate = _normalize_candidate(value)
     if not candidate:
         return None
+    upper_candidate = candidate.upper()
+    if CHANNEL_ID_PATTERN.fullmatch(upper_candidate):
+        return f"https://www.youtube.com/channel/{upper_candidate}"
     if candidate.startswith("@"):
-        candidate = f"https://www.youtube.com/{candidate}"
-    elif candidate.startswith("/"):
+        candidate = candidate.split("/")[0]
+        return f"https://www.youtube.com/{candidate}"
+    if candidate.startswith("/"):
         candidate = f"https://www.youtube.com{candidate}"
+    if candidate.lower().startswith("youtube.com"):
+        candidate = f"https://{candidate}"
+    if not re.match(r"^https?://", candidate, re.IGNORECASE):
+        candidate = f"https://www.youtube.com/{candidate}"
     parsed = urlparse(candidate)
-    if not parsed.scheme:
-        parsed = parsed._replace(scheme="https")
-    if not parsed.netloc:
-        parsed = parsed._replace(netloc="www.youtube.com")
-    if "youtube.com" not in parsed.netloc:
+    netloc = parsed.netloc.lower()
+    if "youtube.com" not in netloc:
         return None
-    return urlunparse(parsed)
+    normalized = parsed._replace(
+        scheme="https",
+        netloc="www.youtube.com",
+        path=_normalize_path(parsed.path),
+        params="",
+        query="",
+        fragment="",
+    )
+    return urlunparse(normalized)
 
 
 def _extract_channel_id_from_html(html_text: str) -> Optional[str]:
@@ -86,6 +146,78 @@ def _extract_channel_id_from_html(html_text: str) -> Optional[str]:
     return None
 
 
+def _extract_canonical_channel_url(html_text: str) -> Optional[str]:
+    patterns = [
+        r'<link[^>]+rel="canonical"[^>]+href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
+        r'<meta[^>]+property="og:url"[^>]+content="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
+        r'<meta[^>]+itemprop="channelId"[^>]+content="(UC[\w-]{22})"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            channel_id = match.group(1).upper()
+            return f"https://www.youtube.com/channel/{channel_id}"
+    return None
+
+
+def _normalize_handle(value: str) -> Optional[str]:
+    if not value:
+        return None
+    candidate = value.strip()
+    candidate = candidate.replace("\\/", "/")
+    candidate = candidate.split("/", 1)[0]
+    if not candidate:
+        return None
+    if not candidate.startswith("@"):
+        candidate = f"@{candidate.lstrip('@')}"
+    match = HANDLE_PATTERN.fullmatch(candidate)
+    if not match:
+        return None
+    return candidate
+
+
+def _extract_handle_from_html(html_text: str) -> Optional[str]:
+    patterns = [
+        r'<link[^>]+rel="canonical"[^>]+href="https://www\.youtube\.com/(@[^"/?#]+)"',
+        r'<meta[^>]+property="og:url"[^>]+content="https://www\.youtube\.com/(@[^"/?#]+)"',
+        r'"canonicalBaseUrl"\s*:\s*"\\?/?(@[^"\\]+)"',
+        r'"channelHandle"\s*:\s*"(@[^"\\]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            handle = _normalize_handle(match.group(1))
+            if handle:
+                return handle
+    return None
+
+
+def _extract_handle_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    for segment in [segment for segment in parsed.path.split("/") if segment]:
+        if segment.startswith("@"):
+            handle = _normalize_handle(segment)
+            if handle:
+                return handle
+    return None
+
+
+def _extract_channel_title(html_text: str) -> Optional[str]:
+    patterns = [
+        r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"',
+        r'<meta[^>]+name="title"[^>]+content="([^"]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text)
+        if match:
+            title = html.unescape(match.group(1)).strip()
+            if title:
+                return title
+    return None
+
+
 def extract_channel_id(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -100,21 +232,11 @@ def extract_channel_id(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def resolve_channel_id(value: Optional[str], *, timeout: int = 5) -> Optional[str]:
-    channel_id = extract_channel_id(value)
-    if channel_id:
-        return channel_id
-    url = _ensure_absolute_url(value or "")
-    if not url:
-        return None
-    try:
-        RATE_LIMITER.wait()
-        response = SESSION.get(url, timeout=timeout)
-    except requests.RequestException:
-        return None
-    if response.status_code >= 400:
-        return None
-    return _extract_channel_id_from_html(response.text)
+def resolve_channel_id(value: Optional[str], *, timeout: int = 8) -> Optional[str]:
+    resolution, _ = resolve_channel(value, timeout=timeout)
+    if resolution:
+        return resolution.channel_id
+    return None
 
 
 class RateLimiter:
@@ -153,6 +275,84 @@ class ChannelSearchResult:
     title: str
     url: str
     subscribers: Optional[int]
+
+
+@dataclass(frozen=True)
+class ChannelResolution:
+    channel_id: str
+    canonical_url: str
+    handle: Optional[str] = None
+    title: Optional[str] = None
+
+
+def normalize_channel_reference(value: Optional[str]) -> str:
+    candidate = sanitize_channel_input(value)
+    if not candidate:
+        return ""
+    upper_candidate = candidate.upper()
+    if CHANNEL_ID_PATTERN.fullmatch(upper_candidate):
+        return upper_candidate
+    absolute = _ensure_absolute_url(candidate)
+    return absolute or ""
+
+
+def resolve_channel(value: Optional[str], *, timeout: int = 8) -> Tuple[Optional[ChannelResolution], Optional[str]]:
+    base_value = sanitize_channel_input(value)
+    if not base_value:
+        return None, "invalid_input"
+    normalized = normalize_channel_reference(base_value)
+    if not normalized:
+        return None, "invalid_url"
+    is_channel_id = normalized.upper().startswith("UC") and len(normalized) == 24 and "/" not in normalized
+    fetch_url = (
+        f"https://www.youtube.com/channel/{normalized}"
+        if is_channel_id
+        else normalized
+    )
+    try:
+        RATE_LIMITER.wait()
+        response = SESSION.get(fetch_url, timeout=timeout, allow_redirects=True)
+    except requests.Timeout:
+        return None, "network_error"
+    except requests.RequestException:
+        return None, "network_error"
+
+    status = response.status_code
+    if status == 404:
+        return None, "not_found"
+    if status >= 500:
+        return None, "network_error"
+    if status >= 400:
+        return None, "resolution_failed"
+
+    html_text = response.text
+    channel_id = _extract_channel_id_from_html(html_text)
+    if not channel_id:
+        channel_id = extract_channel_id(response.url)
+    if not channel_id and is_channel_id:
+        channel_id = normalized
+    if not channel_id:
+        return None, "resolution_failed"
+
+    canonical_url = _extract_canonical_channel_url(html_text)
+    if not canonical_url:
+        canonical_url = f"https://www.youtube.com/channel/{channel_id}"
+
+    handle = _extract_handle_from_html(html_text)
+    if not handle:
+        handle = _extract_handle_from_url(response.url)
+
+    title = _extract_channel_title(html_text)
+
+    return (
+        ChannelResolution(
+            channel_id=channel_id,
+            canonical_url=canonical_url,
+            handle=handle,
+            title=title,
+        ),
+        None,
+    )
 
 
 def _extract_ytinitialdata(html: str) -> Optional[Dict]:

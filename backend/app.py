@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,13 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from . import database
 from .database import ChannelCategory, ChannelFilters, ensure_channel_url
 from .enrichment import manager
-from .youtube import resolve_channel_id, search_channels
+from .youtube import (
+    ChannelResolution,
+    normalize_channel_reference,
+    resolve_channel,
+    sanitize_channel_input,
+    search_channels,
+)
 
 app = FastAPI(title="Crypto YouTube Harvester")
 app.add_middleware(
@@ -195,41 +201,144 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
 
     timestamp = dt.datetime.utcnow().isoformat()
     seen: Set[str] = set()
-    cache: Dict[str, Optional[str]] = {}
-    summary = {"created": 0, "updated": 0, "skipped": 0, "unresolved": 0}
+    cache: Dict[str, Tuple[Optional[ChannelResolution], Optional[str]]] = {}
+    created: List[Dict[str, Any]] = []
+    updated: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, Any]] = []
+    processed = 0
+
+    unresolved_messages = {
+        "invalid_input": "No usable channel reference found in this row.",
+        "invalid_url": "Value is not a valid YouTube channel URL or ID.",
+        "network_error": "Network error while contacting YouTube.",
+        "not_found": "Channel appears to be missing or unavailable.",
+        "resolution_failed": "Unable to resolve a channel ID from the provided value.",
+    }
+    skipped_messages = {
+        "duplicate_in_file": "Duplicate channel in uploaded CSV.",
+        "already_blacklisted": "Channel already blacklisted.",
+    }
 
     for row in reader:
-        if not row:
-            summary["skipped"] += 1
-            continue
-        normalized = {str(key).strip().lower(): (value or "").strip() for key, value in row.items() if key}
-        candidate = normalized.get("channel_id") or normalized.get("url")
-        if not candidate:
-            summary["skipped"] += 1
+        processed += 1
+        normalized = {
+            str(key).strip().lower(): (value or "").strip()
+            for key, value in row.items()
+            if key
+        }
+        source_column = "channel_id" if normalized.get("channel_id") else "url"
+        candidate_value = normalized.get(source_column) or normalized.get("url") or ""
+        row_number = reader.line_num
+        original_value = candidate_value.strip()
+        sanitized_value = sanitize_channel_input(candidate_value)
+        if not sanitized_value:
+            unresolved.append(
+                {
+                    "row": row_number,
+                    "input": original_value,
+                    "normalized": sanitized_value,
+                    "reason": "invalid_input",
+                    "message": unresolved_messages["invalid_input"],
+                    "column": source_column,
+                }
+            )
             continue
 
-        if candidate not in cache:
-            cache[candidate] = resolve_channel_id(candidate)
-        channel_id = cache[candidate]
-        if not channel_id:
-            summary["skipped"] += 1
-            summary["unresolved"] += 1
+        normalized_reference = normalize_channel_reference(sanitized_value)
+        if not normalized_reference:
+            unresolved.append(
+                {
+                    "row": row_number,
+                    "input": original_value or sanitized_value,
+                    "normalized": sanitized_value,
+                    "reason": "invalid_url",
+                    "message": unresolved_messages["invalid_url"],
+                    "column": source_column,
+                }
+            )
             continue
 
+        cache_key = normalized_reference.lower()
+        if cache_key not in cache:
+            cache[cache_key] = resolve_channel(normalized_reference)
+        resolution, reason = cache[cache_key]
+        if not resolution:
+            reason_code = reason or "resolution_failed"
+            unresolved.append(
+                {
+                    "row": row_number,
+                    "input": original_value or sanitized_value,
+                    "normalized": sanitized_value,
+                    "reason": reason_code,
+                    "message": unresolved_messages.get(
+                        reason_code, unresolved_messages["resolution_failed"]
+                    ),
+                    "column": source_column,
+                }
+            )
+            continue
+
+        channel_id = resolution.channel_id.upper()
         if channel_id in seen:
-            summary["skipped"] += 1
+            skipped.append(
+                {
+                    "row": row_number,
+                    "channel_id": channel_id,
+                    "reason": "duplicate_in_file",
+                    "message": skipped_messages["duplicate_in_file"],
+                    "column": source_column,
+                }
+            )
             continue
 
         seen.add(channel_id)
-        already_blacklisted = database.is_blacklisted(channel_id)
-        database.blacklist_channels_by_ids([channel_id], timestamp)
-        updated, created = database.ensure_blacklisted_channel(channel_id, timestamp)
-        if not already_blacklisted and created:
-            summary["created"] += 1
-        else:
-            summary["updated"] += 1
+        if database.is_blacklisted(channel_id):
+            skipped.append(
+                {
+                    "row": row_number,
+                    "channel_id": channel_id,
+                    "reason": "already_blacklisted",
+                    "message": skipped_messages["already_blacklisted"],
+                    "column": source_column,
+                }
+            )
+            continue
 
-    return JSONResponse(summary)
+        moved = database.blacklist_channels_by_ids([channel_id], timestamp)
+        database.ensure_blacklisted_channel(
+            channel_id,
+            timestamp,
+            url=resolution.canonical_url,
+            name=resolution.title or resolution.handle,
+        )
+        record = {
+            "channel_id": channel_id,
+            "url": resolution.canonical_url,
+            "handle": resolution.handle,
+            "name": resolution.title or resolution.handle,
+        }
+        if moved:
+            updated.append(record)
+        else:
+            created.append(record)
+
+    result = {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "unresolved": unresolved,
+        "counts": {
+            "created": len(created),
+            "updated": len(updated),
+            "skipped": len(skipped),
+            "unresolved": len(unresolved),
+            "processed": processed,
+        },
+        "processedAt": timestamp,
+    }
+
+    return JSONResponse(result)
 
 
 @app.post("/api/enrich")

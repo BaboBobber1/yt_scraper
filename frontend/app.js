@@ -934,13 +934,140 @@ class Dashboard {
 
   openModal() {
     this.el.modal.removeAttribute('hidden');
-    this.el.modalSummary.textContent = '';
+    this.el.modalSummary.innerHTML = '';
     this.el.modalSummary.className = 'modal-summary';
     this.el.modalForm.reset();
+    if (this.el.modalFile) {
+      this.el.modalFile.value = '';
+      requestAnimationFrame(() => {
+        try {
+          if (typeof this.el.modalFile.showPicker === 'function') {
+            this.el.modalFile.showPicker();
+          } else {
+            this.el.modalFile.click();
+          }
+        } catch (err) {
+          console.warn('File picker showPicker failed, falling back to click()', err);
+          this.el.modalFile.click();
+        }
+      });
+    }
   }
 
   closeModal() {
     this.el.modal.setAttribute('hidden', 'true');
+  }
+
+  renderBlacklistImportResult(result) {
+    const summaryEl = this.el.modalSummary;
+    if (!summaryEl) {
+      return;
+    }
+    if (!result || typeof result !== 'object') {
+      summaryEl.textContent = 'Import completed.';
+      summaryEl.className = 'modal-summary modal-summary--success';
+      return;
+    }
+
+    const countsSource = result.counts || {};
+    const counts = {
+      created:
+        typeof countsSource.created === 'number'
+          ? countsSource.created
+          : Array.isArray(result.created)
+            ? result.created.length
+            : 0,
+      updated:
+        typeof countsSource.updated === 'number'
+          ? countsSource.updated
+          : Array.isArray(result.updated)
+            ? result.updated.length
+            : 0,
+      skipped:
+        typeof countsSource.skipped === 'number'
+          ? countsSource.skipped
+          : Array.isArray(result.skipped)
+            ? result.skipped.length
+            : 0,
+      unresolved:
+        typeof countsSource.unresolved === 'number'
+          ? countsSource.unresolved
+          : Array.isArray(result.unresolved)
+            ? result.unresolved.length
+            : 0,
+      processed:
+        typeof countsSource.processed === 'number' ? countsSource.processed : null,
+    };
+
+    const summaryParts = [
+      `${counts.created} created`,
+      `${counts.updated} updated`,
+      `${counts.skipped} skipped`,
+      `${counts.unresolved} unresolved`,
+    ];
+    const summaryLine = `Imported: ${summaryParts.join(' • ')}`;
+    let html = `<p class="modal-summary__headline">${escapeHtml(summaryLine)}</p>`;
+
+    if (counts.processed != null) {
+      const processedText = `Processed ${counts.processed} row${counts.processed === 1 ? '' : 's'}.`;
+      html += `<p class="modal-summary__meta-line">${escapeHtml(processedText)}</p>`;
+    }
+
+    if (counts.skipped > 0) {
+      html +=
+        '<p class="modal-summary__meta-line">Skipped entries include duplicates or already blacklisted channels.</p>';
+    }
+
+    const unresolvedItems = Array.isArray(result.unresolved) ? result.unresolved : [];
+    if (unresolvedItems.length) {
+      const listItems = unresolvedItems
+        .map((item) => {
+          const normalized = typeof item?.normalized === 'string' ? item.normalized : '';
+          const original = typeof item?.input === 'string' ? item.input : '';
+          const inputValueRaw = normalized || original;
+          const inputValue = escapeHtml(inputValueRaw || '[empty]');
+          const metaParts = [];
+          if (typeof item?.row === 'number') {
+            metaParts.push(`row ${item.row}`);
+          }
+          if (typeof item?.column === 'string' && item.column) {
+            metaParts.push(item.column);
+          }
+          const metaLabel = metaParts.length
+            ? `<span class="modal-summary__meta">${escapeHtml(metaParts.join(' · '))}</span>`
+            : '';
+          const messageText = typeof item?.message === 'string' && item.message
+            ? escapeHtml(item.message)
+            : 'Unable to resolve channel.';
+          const reasonText =
+            typeof item?.reason === 'string' && item.reason && item.reason !== item.message
+              ? `<span class="modal-summary__reason">[${escapeHtml(item.reason)}]</span>`
+              : '';
+          return `
+            <li class="modal-summary__item">
+              <div class="modal-summary__item-header">⚠️ <code class="modal-summary__code">${inputValue}</code>${metaLabel}</div>
+              <div class="modal-summary__message">${messageText}${reasonText}</div>
+            </li>
+          `;
+        })
+        .join('');
+      const openAttr = unresolvedItems.length <= 3 ? ' open' : '';
+      html += `
+        <details class="modal-summary__details"${openAttr}>
+          <summary>Review unresolved (${unresolvedItems.length})</summary>
+          <ul class="modal-summary__list">${listItems}</ul>
+        </details>
+      `;
+    }
+
+    summaryEl.innerHTML = html;
+    const classes = ['modal-summary'];
+    if (counts.created > 0 || counts.updated > 0) {
+      classes.push('modal-summary--success');
+    } else if (counts.unresolved > 0) {
+      classes.push('modal-summary--error');
+    }
+    summaryEl.className = classes.join(' ');
   }
 
   async handleBlacklistImport() {
@@ -952,10 +1079,11 @@ class Dashboard {
     }
     this.el.modalSubmit.disabled = true;
     this.el.modalCancel.disabled = true;
+    this.el.modalSummary.innerHTML = '<p class="modal-summary__headline">Importing…</p>';
+    this.el.modalSummary.className = 'modal-summary';
     try {
-      const summary = await importBlacklist(file);
-      this.el.modalSummary.textContent = `Imported: ${summary.created} new • ${summary.updated} updated • ${summary.skipped} skipped • ${summary.unresolved} unresolved`;
-      this.el.modalSummary.className = 'modal-summary modal-summary--success';
+      const result = await importBlacklist(file);
+      this.renderBlacklistImportResult(result);
       await this.loadStats();
       await this.loadTable(Category.BLACKLISTED, (state) => ({ ...state, loading: true }));
       this.updateStatusBar('Blacklist import completed.', 'success');
