@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import database
-from .database import ChannelFilters, ensure_channel_url
+from .database import ChannelCategory, ChannelFilters, ensure_channel_url
 from .enrichment import manager
 from .youtube import resolve_channel_id, search_channels
 
@@ -96,6 +96,16 @@ def _collect_filters(
     )
 
 
+def _parse_category(value: Optional[str]) -> ChannelCategory:
+    if value is None:
+        return ChannelCategory.ACTIVE
+    try:
+        return ChannelCategory(value.lower())
+    except ValueError as exc:
+        allowed = ", ".join(category.value for category in ChannelCategory)
+        raise HTTPException(status_code=400, detail=f"category must be one of: {allowed}") from exc
+
+
 @app.get("/")
 def serve_index() -> FileResponse:
     return FileResponse("frontend/index.html")
@@ -129,12 +139,12 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
             continue
         for result in results:
             if database.is_blacklisted(result.channel_id):
-                database.archive_or_create_channel(result.channel_id, now)
+                database.ensure_blacklisted_channel(result.channel_id, now)
                 continue
             new_channels.append(
                 {
                     "channel_id": result.channel_id,
-                    "title": result.title,
+                    "name": result.title,
                     "url": ensure_channel_url(result.channel_id, result.url),
                     "subscribers": result.subscribers,
                     "created_at": now,
@@ -148,8 +158,6 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                     "status": "new",
                     "status_reason": None,
                     "last_status_change": now,
-                    "archived": False,
-                    "archived_at": None,
                 }
             )
 
@@ -213,11 +221,11 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
             continue
 
         seen.add(channel_id)
-        updated, created = database.archive_or_create_channel(channel_id, timestamp)
-        if created:
+        already_blacklisted = database.is_blacklisted(channel_id)
+        database.blacklist_channels_by_ids([channel_id], timestamp)
+        updated, created = database.ensure_blacklisted_channel(channel_id, timestamp)
+        if not already_blacklisted and created:
             summary["created"] += 1
-        elif updated:
-            summary["updated"] += 1
         else:
             summary["updated"] += 1
 
@@ -269,7 +277,9 @@ def api_channels(
     offset: int = Query(default=0, ge=0),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
+    category_value = _parse_category(category)
     filters = _collect_filters(
         q=q,
         languages=language,
@@ -280,6 +290,7 @@ def api_channels(
         include_archived=include_archived,
     )
     items, total = database.get_channels(
+        category_value,
         filters,
         sort=sort,
         order=order,
@@ -312,7 +323,11 @@ def api_archive_bulk(
     offset: int = Query(default=0, ge=0),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
+    category_value = _parse_category(category)
+    if category_value is not ChannelCategory.ACTIVE:
+        raise HTTPException(status_code=400, detail="Archive bulk only supported for active channels")
     channel_ids: Optional[List[str]] = None
     if isinstance(payload, dict):
         ids = payload.get("channel_ids")
@@ -337,7 +352,7 @@ def api_archive_bulk(
             include_archived=include_archived,
         )
         items, _ = database.get_channels(
-            filters,
+            category_value,
             sort=sort,
             order=order,
             limit=limit,
@@ -347,6 +362,156 @@ def api_archive_bulk(
 
     archived_ids = database.archive_channels_by_ids(channel_ids or [], timestamp)
     return JSONResponse({"archived": len(archived_ids), "archivedIds": archived_ids, "archivedAt": timestamp})
+
+
+@app.post("/api/channels/{channel_id}/blacklist")
+def api_blacklist_channel(channel_id: str, category: Optional[str] = Query(default=None)) -> JSONResponse:
+    timestamp = dt.datetime.utcnow().isoformat()
+    sources: Optional[List[ChannelCategory]] = None
+    if category:
+        parsed = _parse_category(category)
+        if parsed is ChannelCategory.BLACKLISTED:
+            raise HTTPException(status_code=400, detail="Channel already blacklisted")
+        sources = [parsed]
+    blacklisted_ids = database.blacklist_channels_by_ids([channel_id], timestamp, source_categories=sources)
+    database.ensure_blacklisted_channel(channel_id, timestamp)
+    if not blacklisted_ids and not database.is_blacklisted(channel_id):
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return JSONResponse(
+        {
+            "blacklisted": len(blacklisted_ids) or 1,
+            "blacklistedIds": blacklisted_ids or [channel_id],
+            "blacklistedAt": timestamp,
+        }
+    )
+
+
+@app.post("/api/channels/blacklist_bulk")
+def api_blacklist_bulk(
+    payload: Dict[str, Any] = Body(default={}),
+    q: Optional[str] = Query(default=None),
+    language: Optional[List[str]] = Query(default=None),
+    status: Optional[List[str]] = Query(default=None),
+    min_subscribers: Optional[str] = Query(default=None),
+    max_subscribers: Optional[str] = Query(default=None),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc"),
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+    emails_only: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
+    category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
+) -> JSONResponse:
+    category_value = _parse_category(category)
+    channel_ids: Optional[List[str]] = None
+    if isinstance(payload, dict):
+        ids = payload.get("channel_ids")
+        if ids is not None:
+            if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
+                raise HTTPException(status_code=400, detail="channel_ids must be a list of strings")
+            channel_ids = ids
+        filter_mode = payload.get("filter")
+        if filter_mode == "emails_only":
+            emails_only = True
+
+    if channel_ids is None:
+        filters = _collect_filters(
+            q=q,
+            languages=language,
+            statuses=status,
+            min_subscribers=min_subscribers,
+            max_subscribers=max_subscribers,
+            emails_only=emails_only,
+            include_archived=include_archived,
+        )
+        items, _ = database.get_channels(
+            category_value,
+            filters,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
+        channel_ids = [item["channel_id"] for item in items]
+
+    timestamp = dt.datetime.utcnow().isoformat()
+    sources: Optional[List[ChannelCategory]] = None
+    if category_value is not ChannelCategory.BLACKLISTED:
+        sources = [category_value]
+    blacklisted_ids = database.blacklist_channels_by_ids(channel_ids or [], timestamp, source_categories=sources)
+    for channel_id in channel_ids or []:
+        database.ensure_blacklisted_channel(channel_id, timestamp)
+    return JSONResponse(
+        {
+            "blacklisted": len(blacklisted_ids),
+            "blacklistedIds": blacklisted_ids,
+            "blacklistedAt": timestamp,
+        }
+    )
+
+
+@app.post("/api/channels/{channel_id}/restore")
+def api_restore_channel(channel_id: str) -> JSONResponse:
+    timestamp = dt.datetime.utcnow().isoformat()
+    restored_ids = database.restore_channels_by_ids([channel_id], timestamp)
+    if not restored_ids:
+        raise HTTPException(status_code=404, detail="Channel not found in archived or blacklisted tables")
+    return JSONResponse({"restored": len(restored_ids), "restoredIds": restored_ids, "restoredAt": timestamp})
+
+
+@app.post("/api/channels/restore_bulk")
+def api_restore_bulk(
+    payload: Dict[str, Any] = Body(default={}),
+    q: Optional[str] = Query(default=None),
+    language: Optional[List[str]] = Query(default=None),
+    status: Optional[List[str]] = Query(default=None),
+    min_subscribers: Optional[str] = Query(default=None),
+    max_subscribers: Optional[str] = Query(default=None),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc"),
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+    emails_only: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
+    category: Optional[str] = Query(default=ChannelCategory.ARCHIVED.value),
+) -> JSONResponse:
+    category_value = _parse_category(category)
+    if category_value is ChannelCategory.ACTIVE:
+        raise HTTPException(status_code=400, detail="Restore requires archived or blacklisted category")
+    channel_ids: Optional[List[str]] = None
+    if isinstance(payload, dict):
+        ids = payload.get("channel_ids")
+        if ids is not None:
+            if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
+                raise HTTPException(status_code=400, detail="channel_ids must be a list of strings")
+            channel_ids = ids
+        filter_mode = payload.get("filter")
+        if filter_mode == "emails_only":
+            emails_only = True
+
+    if channel_ids is None:
+        filters = _collect_filters(
+            q=q,
+            languages=language,
+            statuses=status,
+            min_subscribers=min_subscribers,
+            max_subscribers=max_subscribers,
+            emails_only=emails_only,
+            include_archived=include_archived,
+        )
+        items, _ = database.get_channels(
+            category_value,
+            filters,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
+        channel_ids = [item["channel_id"] for item in items]
+
+    timestamp = dt.datetime.utcnow().isoformat()
+    restored_ids = database.restore_channels_by_ids(channel_ids or [], timestamp, source_categories=[category_value])
+    return JSONResponse({"restored": len(restored_ids), "restoredIds": restored_ids, "restoredAt": timestamp})
 
 
 @app.get("/api/export/csv")
@@ -361,7 +526,9 @@ def api_export_csv(
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
     unique_emails: bool = Query(default=False),
+    category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> PlainTextResponse:
+    category_value = _parse_category(category)
     filters = _collect_filters(
         q=q,
         languages=language,
@@ -375,7 +542,7 @@ def api_export_csv(
     writer = csv.writer(buffer)
 
     if emails_only and unique_emails:
-        rows = database.get_unique_email_rows(filters)
+        rows = database.get_unique_email_rows(filters, category=category_value)
         writer.writerow(
             [
                 "Email",
@@ -397,6 +564,7 @@ def api_export_csv(
             )
     else:
         items, _ = database.get_channels(
+            category_value,
             filters,
             sort=sort,
             order=order,
@@ -421,7 +589,7 @@ def api_export_csv(
         for item in items:
             writer.writerow(
                 [
-                    item.get("title") or "",
+                    item.get("name") or "",
                     item.get("url") or "",
                     item.get("subscribers") or "",
                     item.get("language") or "",
