@@ -353,6 +353,7 @@ def api_archive_bulk(
         )
         items, _ = database.get_channels(
             category_value,
+            filters,
             sort=sort,
             order=order,
             limit=limit,
