@@ -9,6 +9,7 @@ const state = {
   minSubscribers: '',
   maxSubscribers: '',
   total: 0,
+  visibleCount: 0,
   rows: new Map(),
   eventSource: null,
   currentJobId: null,
@@ -16,6 +17,7 @@ const state = {
   progress: { total: 0, completed: 0, errors: 0, pending: 0, durationSeconds: 0 },
   emailsOnly: false,
   includeArchived: false,
+  uniqueEmails: false,
   enrichmentBusy: false,
 };
 
@@ -27,6 +29,7 @@ const tableBody = document.querySelector('#channelsTable tbody');
 const pageInfo = document.getElementById('pageInfo');
 const archiveAllBtn = document.getElementById('archiveAllBtn');
 const emailsToggle = document.getElementById('emailsToggle');
+const uniqueEmailsToggle = document.getElementById('uniqueEmailsToggle');
 const hideArchivedToggle = document.getElementById('hideArchivedToggle');
 const enrichBtn = document.getElementById('enrichBtn');
 const enrichEmailBtn = document.getElementById('enrichEmailBtn');
@@ -66,6 +69,39 @@ function parseListInput(value) {
     .filter((entry) => entry.length > 0);
 }
 
+const EMAIL_REGEX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gi;
+
+function extractEmails(text) {
+  if (!text) {
+    return [];
+  }
+  const matches = text.match(EMAIL_REGEX);
+  return matches ? matches.map((email) => email.trim()).filter(Boolean) : [];
+}
+
+function applyUniqueEmailFilter(items) {
+  const seen = new Set();
+  const filtered = [];
+  items.forEach((item) => {
+    const emails = extractEmails(item.emails || '');
+    if (emails.length === 0) {
+      return;
+    }
+    const uniqueEmails = [];
+    emails.forEach((email) => {
+      const key = email.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueEmails.push(email);
+      }
+    });
+    if (uniqueEmails.length > 0) {
+      filtered.push({ ...item, emails: uniqueEmails.join(', ') });
+    }
+  });
+  return filtered;
+}
+
 function buildQueryParams({ includePagination = true } = {}) {
   const params = new URLSearchParams();
   if (includePagination) {
@@ -87,6 +123,7 @@ function buildQueryParams({ includePagination = true } = {}) {
   }
   params.set('emails_only', state.emailsOnly ? 'true' : 'false');
   params.set('include_archived', state.includeArchived ? 'true' : 'false');
+  params.set('unique_emails', state.uniqueEmails ? 'true' : 'false');
   return params;
 }
 
@@ -125,6 +162,18 @@ function setBatchSummary(message) {
 
 function setStatsSummary(message) {
   statsSummaryEl.textContent = message;
+}
+
+function syncUniqueToggle() {
+  if (!uniqueEmailsToggle) {
+    return;
+  }
+  uniqueEmailsToggle.disabled = !state.emailsOnly;
+  if (!state.emailsOnly) {
+    uniqueEmailsToggle.checked = false;
+  } else {
+    uniqueEmailsToggle.checked = state.uniqueEmails;
+  }
 }
 
 function resetBlacklistModal() {
@@ -200,11 +249,15 @@ async function handleBlacklistImport(event) {
     } catch (error) {
       console.warn('Failed to parse blacklist import response as JSON', error);
     }
-    const imported = Number(result.imported) || 0;
-    const updated = Number(result.updated) || 0;
     const created = Number(result.created) || 0;
+    const updated = Number(result.updated) || 0;
     const skipped = Number(result.skipped) || 0;
-    const summaryText = `Imported ${imported} channel${imported === 1 ? '' : 's'} (updated: ${updated}, created: ${created}${skipped ? `, skipped: ${skipped}` : ''}).`;
+    const unresolved = Number(result.unresolved) || 0;
+    const imported = created + updated;
+    const skippedText = skipped
+      ? `, skipped: ${skipped}${unresolved ? ` (unresolved: ${unresolved})` : ''}`
+      : '';
+    const summaryText = `Imported ${imported} channel${imported === 1 ? '' : 's'} (updated: ${updated}, created: ${created}${skippedText}).`;
     if (blacklistSummary) {
       blacklistSummary.textContent = summaryText;
       blacklistSummary.dataset.type = 'success';
@@ -247,7 +300,7 @@ function renderEmailsCell(td, emails) {
     td.textContent = '';
     return;
   }
-  const list = emails.split(/[,;]+/).map((email) => email.trim()).filter(Boolean).slice(0, 5);
+  const list = extractEmails(emails).slice(0, 5);
   list.forEach((email, index) => {
     const span = document.createElement('div');
     span.textContent = email;
@@ -392,7 +445,10 @@ function renderTable(items) {
 function updatePagination() {
   const currentPage = Math.floor(state.offset / state.limit) + 1;
   const totalPages = Math.max(1, Math.ceil(state.total / state.limit));
-  pageInfo.textContent = `Page ${currentPage} of ${totalPages} (${state.total} channels)`;
+  const totalLabel = state.emailsOnly && state.uniqueEmails
+    ? `${state.visibleCount} unique email${state.visibleCount === 1 ? '' : 's'}`
+    : `${state.total} channels`;
+  pageInfo.textContent = `Page ${currentPage} of ${totalPages} (${totalLabel})`;
 }
 
 function updateArchiveControls() {
@@ -472,6 +528,7 @@ function markChannelArchived(channelId, archivedAt) {
     applyRowData(element, item);
     state.rows.set(channelId, { element, item });
   }
+  state.visibleCount = state.rows.size;
   updatePagination();
   updateArchiveControls();
   return { removed };
@@ -665,8 +722,13 @@ async function loadChannels() {
   const params = buildQueryParams();
   try {
     const data = await fetchJSON(`/api/channels?${params.toString()}`);
+    let items = Array.isArray(data.items) ? data.items : [];
+    if (state.emailsOnly && state.uniqueEmails) {
+      items = applyUniqueEmailFilter(items);
+    }
     state.total = data.total;
-    renderTable(data.items || []);
+    state.visibleCount = items.length;
+    renderTable(items);
     updatePagination();
   } catch (error) {
     console.error(error);
@@ -895,6 +957,21 @@ function initEvents() {
   if (emailsToggle) {
     emailsToggle.addEventListener('change', (event) => {
       state.emailsOnly = event.target.checked;
+      if (!state.emailsOnly && state.uniqueEmails) {
+        state.uniqueEmails = false;
+      }
+      syncUniqueToggle();
+      state.offset = 0;
+      loadChannels();
+    });
+  }
+
+  if (uniqueEmailsToggle) {
+    uniqueEmailsToggle.addEventListener('change', (event) => {
+      if (uniqueEmailsToggle.disabled) {
+        return;
+      }
+      state.uniqueEmails = event.target.checked;
       state.offset = 0;
       loadChannels();
     });
@@ -914,9 +991,13 @@ async function init() {
   if (emailsToggle) {
     emailsToggle.checked = state.emailsOnly;
   }
+  if (uniqueEmailsToggle) {
+    uniqueEmailsToggle.checked = state.uniqueEmails;
+  }
   if (hideArchivedToggle) {
     hideArchivedToggle.checked = !state.includeArchived;
   }
+  syncUniqueToggle();
   await loadChannels();
   await pollStats();
   statsInterval = setInterval(pollStats, 5000);

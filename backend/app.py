@@ -4,7 +4,6 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
-import re
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
@@ -12,9 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import database
-from .database import ensure_channel_url
+from .database import ChannelFilters, ensure_channel_url
 from .enrichment import manager
-from .youtube import search_channels
+from .youtube import resolve_channel_id, search_channels
 
 app = FastAPI(title="Crypto YouTube Harvester")
 app.add_middleware(
@@ -46,24 +45,6 @@ def _parse_multi(values: Optional[List[str]]) -> Optional[List[str]]:
     return cleaned or None
 
 
-CHANNEL_ID_PATTERN = re.compile(r"(UC[\w-]{22})", re.IGNORECASE)
-
-
-def _extract_channel_id(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    cleaned = cleaned.split("?")[0].rstrip("/")
-    match = CHANNEL_ID_PATTERN.search(cleaned)
-    if match:
-        return match.group(1).upper()
-    if cleaned.upper().startswith("UC") and len(cleaned) == 24 and CHANNEL_ID_PATTERN.match(cleaned):
-        return cleaned.upper()
-    return None
-
-
 def _parse_int(value: Optional[str], *, field: str) -> Optional[int]:
     if value is None:
         return None
@@ -86,7 +67,7 @@ def _collect_filters(
     max_subscribers: Optional[str],
     emails_only: bool,
     include_archived: bool,
-) -> Dict[str, Any]:
+) -> ChannelFilters:
     language_values = [value.lower() for value in _parse_multi(languages) or []] or None
     status_values = [value.lower() for value in _parse_multi(statuses) or []] or None
     if status_values:
@@ -104,15 +85,15 @@ def _collect_filters(
     ):
         raise HTTPException(status_code=400, detail="min_subscribers cannot exceed max_subscribers")
 
-    return {
-        "query_text": q.strip() if q else None,
-        "languages": language_values,
-        "statuses": status_values,
-        "min_subscribers": min_subs_int,
-        "max_subscribers": max_subs_int,
-        "emails_only": emails_only,
-        "include_archived": include_archived,
-    }
+    return ChannelFilters(
+        query_text=q.strip() if q else None,
+        languages=language_values,
+        statuses=status_values,
+        min_subscribers=min_subs_int,
+        max_subscribers=max_subs_int,
+        emails_only=emails_only,
+        include_archived=include_archived,
+    )
 
 
 @app.get("/")
@@ -147,6 +128,9 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
             print(f"Failed to search for keyword '{keyword}': {exc}")
             continue
         for result in results:
+            if database.is_blacklisted(result.channel_id):
+                database.archive_or_create_channel(result.channel_id, now)
+                continue
             new_channels.append(
                 {
                     "channel_id": result.channel_id,
@@ -203,7 +187,8 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
 
     timestamp = dt.datetime.utcnow().isoformat()
     seen: Set[str] = set()
-    summary = {"imported": 0, "updated": 0, "created": 0, "skipped": 0}
+    cache: Dict[str, Optional[str]] = {}
+    summary = {"created": 0, "updated": 0, "skipped": 0, "unresolved": 0}
 
     for row in reader:
         if not row:
@@ -211,20 +196,30 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
             continue
         normalized = {str(key).strip().lower(): (value or "").strip() for key, value in row.items() if key}
         candidate = normalized.get("channel_id") or normalized.get("url")
-        channel_id = _extract_channel_id(candidate)
-        if not channel_id or channel_id in seen:
+        if not candidate:
+            summary["skipped"] += 1
+            continue
+
+        if candidate not in cache:
+            cache[candidate] = resolve_channel_id(candidate)
+        channel_id = cache[candidate]
+        if not channel_id:
+            summary["skipped"] += 1
+            summary["unresolved"] += 1
+            continue
+
+        if channel_id in seen:
             summary["skipped"] += 1
             continue
 
         seen.add(channel_id)
-        summary["imported"] += 1
         updated, created = database.archive_or_create_channel(channel_id, timestamp)
         if created:
             summary["created"] += 1
         elif updated:
             summary["updated"] += 1
         else:
-            summary["skipped"] += 1
+            summary["updated"] += 1
 
     return JSONResponse(summary)
 
@@ -284,17 +279,12 @@ def api_channels(
         emails_only=emails_only,
         include_archived=include_archived,
     )
-    filters.pop("emails_only", None)
-    filters.pop("include_archived", None)
-
     items, total = database.get_channels(
+        filters,
         sort=sort,
         order=order,
         limit=limit,
         offset=offset,
-        emails_only=emails_only,
-        include_archived=include_archived,
-        **filters,
     )
     return JSONResponse({"items": items, "total": total})
 
@@ -346,16 +336,12 @@ def api_archive_bulk(
             emails_only=emails_only,
             include_archived=include_archived,
         )
-        filters.pop("emails_only", None)
-        filters.pop("include_archived", None)
         items, _ = database.get_channels(
+            filters,
             sort=sort,
             order=order,
             limit=limit,
             offset=offset,
-            emails_only=emails_only,
-            include_archived=include_archived,
-            **filters,
         )
         channel_ids = [item["channel_id"] for item in items]
 
@@ -374,6 +360,7 @@ def api_export_csv(
     order: str = Query(default="desc"),
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
+    unique_emails: bool = Query(default=False),
 ) -> PlainTextResponse:
     filters = _collect_filters(
         q=q,
@@ -384,50 +371,69 @@ def api_export_csv(
         emails_only=emails_only,
         include_archived=include_archived,
     )
-    filters.pop("emails_only", None)
-    filters.pop("include_archived", None)
-
-    items, _ = database.get_channels(
-        sort=sort,
-        order=order,
-        limit=10_000,
-        offset=0,
-        emails_only=emails_only,
-        include_archived=include_archived,
-        **filters,
-    )
-    headers = [
-        "Channel Name",
-        "URL",
-        "Subscribers",
-        "Language",
-        "Emails",
-        "Status",
-        "Last Updated",
-        "Last Status Change",
-        "Created At",
-        "Last Attempted",
-        "Error Reason",
-    ]
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(headers)
-    for item in items:
+
+    if emails_only and unique_emails:
+        rows = database.get_unique_email_rows(filters)
         writer.writerow(
             [
-                item.get("title") or "",
-                item.get("url") or "",
-                item.get("subscribers") or "",
-                item.get("language") or "",
-                item.get("emails") or "",
-                item.get("status") or "",
-                item.get("last_updated") or "",
-                item.get("last_status_change") or "",
-                item.get("created_at") or "",
-                item.get("last_attempted") or "",
-                item.get("status_reason") or item.get("last_error") or "",
+                "Email",
+                "Primary Channel Name",
+                "Primary Channel URL",
+                "Other Channels Count",
+                "Last Updated",
             ]
         )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.get("email", ""),
+                    row.get("primary_channel_name", ""),
+                    row.get("primary_channel_url", ""),
+                    row.get("other_channels_count", 0),
+                    row.get("last_updated", ""),
+                ]
+            )
+    else:
+        items, _ = database.get_channels(
+            filters,
+            sort=sort,
+            order=order,
+            limit=10_000,
+            offset=0,
+        )
+        writer.writerow(
+            [
+                "Channel Name",
+                "URL",
+                "Subscribers",
+                "Language",
+                "Emails",
+                "Status",
+                "Last Updated",
+                "Last Status Change",
+                "Created At",
+                "Last Attempted",
+                "Error Reason",
+            ]
+        )
+        for item in items:
+            writer.writerow(
+                [
+                    item.get("title") or "",
+                    item.get("url") or "",
+                    item.get("subscribers") or "",
+                    item.get("language") or "",
+                    item.get("emails") or "",
+                    item.get("status") or "",
+                    item.get("last_updated") or "",
+                    item.get("last_status_change") or "",
+                    item.get("created_at") or "",
+                    item.get("last_attempted") or "",
+                    item.get("status_reason") or item.get("last_error") or "",
+                ]
+            )
 
     csv_data = buffer.getvalue()
     return PlainTextResponse(content=csv_data, media_type="text/csv; charset=utf-8")

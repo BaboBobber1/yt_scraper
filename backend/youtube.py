@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
 import requests
@@ -28,6 +29,92 @@ SESSION.headers.update(
         "Accept-Language": "en-US,en;q=0.9",
     }
 )
+
+CHANNEL_ID_PATTERN = re.compile(r"(UC[\w-]{22})", re.IGNORECASE)
+
+
+def _normalize_candidate(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.split("?")[0].rstrip("/")
+    return cleaned
+
+
+def _ensure_absolute_url(value: str) -> Optional[str]:
+    candidate = _normalize_candidate(value)
+    if not candidate:
+        return None
+    if candidate.startswith("@"):
+        candidate = f"https://www.youtube.com/{candidate}"
+    elif candidate.startswith("/"):
+        candidate = f"https://www.youtube.com{candidate}"
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        parsed = parsed._replace(scheme="https")
+    if not parsed.netloc:
+        parsed = parsed._replace(netloc="www.youtube.com")
+    if "youtube.com" not in parsed.netloc:
+        return None
+    return urlunparse(parsed)
+
+
+def _extract_channel_id_from_html(html_text: str) -> Optional[str]:
+    canonical = re.search(
+        r'<link[^>]+rel="canonical"[^>]+href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
+        html_text,
+        re.IGNORECASE,
+    )
+    if canonical:
+        return canonical.group(1).upper()
+
+    ytcfg_match = re.search(r'"CHANNEL_ID"\s*:\s*"(UC[\w-]{22})"', html_text)
+    if ytcfg_match:
+        return ytcfg_match.group(1).upper()
+
+    channel_match = re.search(r'"channelId"\s*:\s*"(UC[\w-]{22})"', html_text)
+    if channel_match:
+        return channel_match.group(1).upper()
+
+    browse_match = re.search(r'"browseId"\s*:\s*"(UC[\w-]{22})"', html_text)
+    if browse_match:
+        return browse_match.group(1).upper()
+
+    matches = CHANNEL_ID_PATTERN.findall(html_text)
+    if matches:
+        return matches[0].upper()
+    return None
+
+
+def extract_channel_id(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    candidate = _normalize_candidate(value)
+    if not candidate:
+        return None
+    match = CHANNEL_ID_PATTERN.search(candidate)
+    if match:
+        return match.group(1).upper()
+    if candidate.upper().startswith("UC") and len(candidate) == 24:
+        return candidate.upper()
+    return None
+
+
+def resolve_channel_id(value: Optional[str], *, timeout: int = 5) -> Optional[str]:
+    channel_id = extract_channel_id(value)
+    if channel_id:
+        return channel_id
+    url = _ensure_absolute_url(value or "")
+    if not url:
+        return None
+    try:
+        RATE_LIMITER.wait()
+        response = SESSION.get(url, timeout=timeout)
+    except requests.RequestException:
+        return None
+    if response.status_code >= 400:
+        return None
+    return _extract_channel_id_from_html(response.text)
 
 
 class RateLimiter:
