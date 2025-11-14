@@ -1,6 +1,6 @@
 import {
-  archiveByFilter,
   archiveChannels,
+  archiveExportedRows,
   blacklistByFilter,
   blacklistChannels,
   discoverChannels,
@@ -25,7 +25,7 @@ const CategoryInfo = {
     label: 'Active',
     title: 'Active channels',
     subtitle: 'Fresh leads waiting for outreach.',
-    primaryAction: { text: '🟡 Archive (filtered)', tone: 'yellow' },
+    primaryAction: { text: '🟡 Archive current filter', tone: 'yellow' },
     secondaryAction: { text: '🔴 Blacklist (filtered)', tone: 'red' },
   },
   [Category.ARCHIVED]: {
@@ -150,7 +150,6 @@ class Dashboard {
   init() {
     this.cacheElements();
     this.bindEvents();
-    this.updateExportArchiveToggle();
     this.renderTabs();
     this.applyFiltersToUI(this.tables[this.activeTab].filters);
     this.updateSortInputs();
@@ -171,7 +170,6 @@ class Dashboard {
       bulkPrimaryBtn: this.root.querySelector('#bulkPrimaryBtn'),
       bulkSecondaryBtn: this.root.querySelector('#bulkSecondaryBtn'),
       exportCsvBtn: this.root.querySelector('#exportCsvBtn'),
-      exportArchiveToggle: this.root.querySelector('#exportArchiveToggle'),
       sortSelect: this.root.querySelector('#sortSelect'),
       orderSelect: this.root.querySelector('#orderSelect'),
       tableBody: this.root.querySelector('#tableBody'),
@@ -209,17 +207,6 @@ class Dashboard {
       filterEmailGateOnly: this.root.querySelector('#filterEmailGateOnly'),
       filterStatusCheckboxes: Array.from(this.root.querySelectorAll('input[name="statusFilter"]')),
     };
-  }
-
-  updateExportArchiveToggle(category = this.activeTab) {
-    if (!this.el.exportArchiveToggle) {
-      return;
-    }
-    const isActive = category === Category.ACTIVE;
-    this.el.exportArchiveToggle.disabled = !isActive;
-    if (!isActive) {
-      this.el.exportArchiveToggle.checked = false;
-    }
   }
 
   bindEvents() {
@@ -657,7 +644,6 @@ class Dashboard {
 
   changeTab(category) {
     this.activeTab = category;
-    this.updateExportArchiveToggle(category);
     this.renderTabs();
     this.applyFiltersToUI(this.tables[category].filters);
     this.updateSortInputs();
@@ -724,16 +710,21 @@ class Dashboard {
     }
     try {
       if (this.activeTab === Category.ACTIVE) {
-        await archiveByFilter(
-          this.activeTab,
-          this.tables[this.activeTab].filters,
-          this.tables[this.activeTab].sort,
-          this.tables[this.activeTab].order,
-          this.tables[this.activeTab].limit,
-          this.tables[this.activeTab].page,
-        );
-        this.updateStatusBar('Filtered channels archived.', 'success');
-        await this.afterMove(Category.ACTIVE, Category.ARCHIVED);
+        const rows = this.tables[this.activeTab].rows || [];
+        const ids = rows.map((row) => row.channel_id).filter(Boolean);
+        if (!ids.length) {
+          this.updateStatusBar('No channels on this page to archive.', 'info');
+          return;
+        }
+        const result = await archiveChannels(ids);
+        const archivedCount = Number(result?.archived ?? 0);
+        if (archivedCount > 0) {
+          const label = archivedCount === 1 ? 'channel' : 'channels';
+          this.updateStatusBar(`Archived ${formatNumber(archivedCount)} ${label} from the current filter.`, 'success');
+          await this.afterMove(Category.ACTIVE, Category.ARCHIVED);
+        } else {
+          this.updateStatusBar('No channels were archived.', 'info');
+        }
       } else if (this.activeTab === Category.ARCHIVED) {
         await restoreByFilter(
           this.activeTab,
@@ -808,14 +799,12 @@ class Dashboard {
 
   async handleExportCsv() {
     try {
-      const archiveAfterExport = Boolean(this.el.exportArchiveToggle && this.el.exportArchiveToggle.checked);
-      const shouldArchive = this.activeTab === Category.ACTIVE && archiveAfterExport;
-      const csv = await downloadCsv(
+      const table = this.tables[this.activeTab];
+      const { csv, exportTimestamp } = await downloadCsv(
         this.activeTab,
-        this.tables[this.activeTab].filters,
-        this.tables[this.activeTab].sort,
-        this.tables[this.activeTab].order,
-        { archiveExported: shouldArchive },
+        table.filters,
+        table.sort,
+        table.order,
       );
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -827,15 +816,39 @@ class Dashboard {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      if (shouldArchive) {
-        await this.afterMove(Category.ACTIVE, Category.ARCHIVED);
-        this.updateStatusBar('CSV exported and archived.', 'success');
-      } else {
-        this.updateStatusBar('CSV exported successfully.', 'success');
+      this.updateStatusBar('CSV exported successfully.', 'success');
+      if (this.activeTab === Category.ACTIVE && exportTimestamp && table.total > 0) {
+        const confirmArchive = window.confirm('Archive exported rows?');
+        if (confirmArchive) {
+          await this.handleArchiveExportedRows(exportTimestamp);
+        }
       }
     } catch (error) {
       console.error('CSV export failed', error);
       this.updateStatusBar(error instanceof Error ? error.message : 'CSV export failed.', 'error');
+    }
+  }
+
+  async handleArchiveExportedRows(exportTimestamp) {
+    try {
+      this.setProgress('Archiving exported rows…');
+      const result = await archiveExportedRows(exportTimestamp);
+      const archivedCount = Number(result?.archived ?? 0);
+      if (archivedCount > 0) {
+        const label = archivedCount === 1 ? 'channel' : 'channels';
+        this.updateStatusBar(`Archived ${formatNumber(archivedCount)} exported ${label}.`, 'success');
+        await this.afterMove(Category.ACTIVE, Category.ARCHIVED);
+      } else {
+        this.updateStatusBar('No exported rows were archived.', 'info');
+      }
+    } catch (error) {
+      console.error('Archiving exported rows failed', error);
+      this.updateStatusBar(
+        error instanceof Error ? error.message : 'Failed to archive exported rows.',
+        'error',
+      );
+    } finally {
+      this.setProgress('');
     }
   }
 

@@ -152,7 +152,9 @@ export async function downloadCsv(category, filters, sort, order, options = {}) 
     const text = await response.text();
     throw new Error(text || 'Failed to export CSV');
   }
-  return response.text();
+  const exportTimestamp = response.headers.get('x-export-timestamp');
+  const csvText = await response.text();
+  return { csv: csvText, exportTimestamp };
 }
 
 export async function importBlacklist(file) {
@@ -167,4 +169,11 @@ export async function importBlacklist(file) {
     throw new Error(text || 'Import failed');
   }
   return response.json();
+}
+
+export async function archiveExportedRows(exportedAt) {
+  return request('/api/channels/archive_exported', {
+    method: 'POST',
+    body: JSON.stringify({ exported_at: exportedAt }),
+  });
 }

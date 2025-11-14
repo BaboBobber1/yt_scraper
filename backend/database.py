@@ -877,6 +877,24 @@ def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[
     )
 
 
+def archive_channels_by_exported_at(exported_at: str, timestamp: str) -> List[str]:
+    if not exported_at:
+        return []
+
+    with get_cursor() as cursor:
+        cursor.execute(
+            f"SELECT channel_id FROM {CHANNEL_TABLES[ChannelCategory.ACTIVE]} WHERE exported_at = ?",
+            [exported_at],
+        )
+        rows = cursor.fetchall()
+
+    channel_ids = [row["channel_id"] for row in rows if row["channel_id"]]
+    if not channel_ids:
+        return []
+
+    return archive_channels_by_ids(channel_ids, timestamp)
+
+
 def mark_channels_exported(
     category: ChannelCategory,
     channel_ids: Sequence[str],
