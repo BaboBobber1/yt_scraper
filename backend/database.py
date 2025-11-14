@@ -228,9 +228,52 @@ class ChannelFilters:
     emails_only: bool = False
     include_archived: bool = False
     email_gate_only: bool = False
+    unique_emails: bool = False
 
 
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+GLOBAL_DUPLICATE_CHANNELS_QUERY = """
+    SELECT DISTINCT ce.channel_id
+    FROM channel_emails ce
+    JOIN (
+        SELECT email
+        FROM channel_emails
+        GROUP BY email
+        HAVING COUNT(DISTINCT channel_id) > 1
+    ) dup ON dup.email = ce.email
+"""
+
+
+def _collect_duplicate_emails_for_channels(
+    channel_ids: Sequence[str],
+) -> Dict[str, Set[str]]:
+    unique_ids = [channel_id for channel_id in dict.fromkeys(channel_ids) if channel_id]
+    if not unique_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in unique_ids)
+    query = f"""
+        SELECT ce.channel_id, ce.email
+        FROM channel_emails ce
+        JOIN (
+            SELECT email
+            FROM channel_emails
+            GROUP BY email
+            HAVING COUNT(DISTINCT channel_id) > 1
+        ) dup ON dup.email = ce.email
+        WHERE ce.channel_id IN ({placeholders})
+    """
+
+    duplicates: Dict[str, Set[str]] = {}
+    with get_cursor() as cursor:
+        cursor.execute(query, unique_ids)
+        for row in cursor.fetchall():
+            channel_id = row["channel_id"]
+            email = row["email"]
+            if channel_id and email:
+                duplicates.setdefault(channel_id, set()).add(email)
+    return duplicates
 
 
 def _normalize_email(value: str) -> Optional[str]:
@@ -688,6 +731,9 @@ def _build_channel_filters(
     if filters.email_gate_only:
         clauses.append(f"{prefix}email_gate_present = 1")
 
+    if filters.unique_emails and filters.emails_only:
+        clauses.append(f"{prefix}channel_id NOT IN ({GLOBAL_DUPLICATE_CHANNELS_QUERY})")
+
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     return where_clause, params
 
@@ -739,6 +785,20 @@ def get_channels(
     for row in rows:
         item = dict(row)
         items.append(item)
+
+    if items:
+        channels_with_emails = [
+            item.get("channel_id")
+            for item in items
+            if item.get("channel_id") and item.get("emails")
+        ]
+        duplicates_map = _collect_duplicate_emails_for_channels(channels_with_emails)
+        for item in items:
+            duplicate_values = sorted(duplicates_map.get(item.get("channel_id"), set()))
+            item["duplicate_email_count"] = len(duplicate_values)
+            item["duplicate_emails"] = ", ".join(duplicate_values)
+            item["has_duplicate_emails"] = bool(duplicate_values)
+
     return items, total
 
 

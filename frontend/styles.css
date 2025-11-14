@@ -452,6 +452,11 @@ a:hover {
   color: #acd4ff;
 }
 
+.badge--duplicate {
+  background: rgba(255, 163, 77, 0.18);
+  color: #ffd9b2;
+}
+
 .emails-cell {
   max-width: 220px;
   white-space: pre-wrap;

@@ -131,39 +131,6 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-const EMAIL_REGEX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gi;
-
-function extractEmails(text) {
-  if (!text) {
-    return [];
-  }
-  const matches = text.match(EMAIL_REGEX);
-  return matches ? matches.map((email) => email.trim()).filter(Boolean) : [];
-}
-
-function applyUniqueEmailFilter(items) {
-  const seen = new Set();
-  const filtered = [];
-  for (const item of items) {
-    const emails = extractEmails(item.emails || '');
-    if (!emails.length) {
-      continue;
-    }
-    const unique = [];
-    for (const email of emails) {
-      const key = email.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(email);
-      }
-    }
-    if (unique.length) {
-      filtered.push({ ...item, emails: unique.join(', ') });
-    }
-  }
-  return filtered;
-}
-
 class Dashboard {
   constructor(root) {
     this.root = root;
@@ -476,11 +443,8 @@ class Dashboard {
         snapshot.limit,
         snapshot.page,
       );
-      let rows = items;
-      if (snapshot.filters.emailsOnly && snapshot.filters.uniqueEmails) {
-        rows = applyUniqueEmailFilter(items);
-      }
-      const effectiveTotal = snapshot.filters.emailsOnly && snapshot.filters.uniqueEmails ? rows.length : total;
+      const rows = items;
+      const effectiveTotal = total;
       const maxPage = effectiveTotal > 0 ? Math.max(0, Math.ceil(effectiveTotal / snapshot.limit) - 1) : 0;
       if (snapshot.page > maxPage) {
         const newPage = Math.max(0, maxPage);
@@ -623,9 +587,21 @@ class Dashboard {
     const emails = row.emails ? escapeHtml(row.emails) : '—';
     const reason = statusReason ? escapeHtml(statusReason) : '';
     const emailGate = Boolean(row.email_gate_present);
-    const badgesHtml = emailGate
-      ? '<div class="name-badges"><span class="badge badge--gate">🔒 Email gate</span></div>'
-      : '';
+    const duplicateCount = Number(row.duplicate_email_count || 0);
+    const badges = [];
+    if (emailGate) {
+      badges.push('<span class="badge badge--gate">🔒 Email gate</span>');
+    }
+    if (duplicateCount > 0) {
+      const duplicateLabel = duplicateCount > 1 ? 'Duplicate emails' : 'Duplicate email';
+      const duplicateTitle = row.duplicate_emails
+        ? `Also seen on other channels: ${row.duplicate_emails}`
+        : 'Email address also appears on other channels';
+      badges.push(
+        `<span class="badge badge--duplicate" title="${escapeHtml(duplicateTitle)}">⚠️ ${duplicateLabel}</span>`
+      );
+    }
+    const badgesHtml = badges.length ? `<div class="name-badges">${badges.join('')}</div>` : '';
 
     return `
       <tr>

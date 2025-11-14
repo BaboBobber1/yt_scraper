@@ -76,6 +76,7 @@ def _collect_filters(
     emails_only: bool,
     include_archived: bool,
     email_gate_only: bool,
+    unique_emails: bool,
 ) -> ChannelFilters:
     language_values = [value.lower() for value in _parse_multi(languages) or []] or None
     status_values = [value.lower() for value in _parse_multi(statuses) or []] or None
@@ -103,6 +104,7 @@ def _collect_filters(
         emails_only=emails_only,
         include_archived=include_archived,
         email_gate_only=email_gate_only,
+        unique_emails=emails_only and unique_emails,
     )
 
 
@@ -515,6 +517,7 @@ def api_channels(
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
     email_gate_only: bool = Query(default=False),
+    unique_emails: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -527,6 +530,7 @@ def api_channels(
         emails_only=emails_only,
         include_archived=include_archived,
         email_gate_only=email_gate_only,
+        unique_emails=unique_emails,
     )
     items, total = database.get_channels(
         category_value,
@@ -563,6 +567,7 @@ def api_archive_bulk(
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
     email_gate_only: bool = Query(default=False),
+    unique_emails: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -591,6 +596,7 @@ def api_archive_bulk(
             emails_only=emails_only,
             include_archived=include_archived,
             email_gate_only=email_gate_only,
+            unique_emails=unique_emails,
         )
         items, _ = database.get_channels(
             category_value,
@@ -643,6 +649,7 @@ def api_blacklist_bulk(
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
     email_gate_only: bool = Query(default=False),
+    unique_emails: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -667,6 +674,7 @@ def api_blacklist_bulk(
             emails_only=emails_only,
             include_archived=include_archived,
             email_gate_only=email_gate_only,
+            unique_emails=unique_emails,
         )
         items, _ = database.get_channels(
             category_value,
@@ -718,6 +726,7 @@ def api_restore_bulk(
     emails_only: bool = Query(default=False),
     include_archived: bool = Query(default=False),
     email_gate_only: bool = Query(default=False),
+    unique_emails: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ARCHIVED.value),
 ) -> JSONResponse:
     category_value = _parse_category(category)
@@ -744,6 +753,7 @@ def api_restore_bulk(
             emails_only=emails_only,
             include_archived=include_archived,
             email_gate_only=email_gate_only,
+            unique_emails=unique_emails,
         )
         items, _ = database.get_channels(
             category_value,
@@ -786,6 +796,7 @@ def api_export_csv(
         emails_only=emails_only,
         include_archived=include_archived,
         email_gate_only=email_gate_only,
+        unique_emails=unique_emails,
     )
     buffer = io.StringIO()
     writer = csv.writer(buffer)
