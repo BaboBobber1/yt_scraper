@@ -314,6 +314,7 @@ def ensure_blacklisted_channel(
     url: Optional[str] = None,
     name: Optional[str] = None,
     reason: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, bool]:
     """Ensure a record exists for the channel in the blacklist tables."""
 
@@ -327,6 +328,41 @@ def ensure_blacklisted_channel(
     status_reason = reason.strip() if isinstance(reason, str) else None
     if status_reason == "":
         status_reason = None
+
+    metadata_payload: Dict[str, Any] = {}
+    if metadata and isinstance(metadata, dict):
+        subscribers_value = metadata.get("subscribers")
+        if subscribers_value is not None:
+            if isinstance(subscribers_value, bool):
+                subscribers_int = int(subscribers_value)
+            elif isinstance(subscribers_value, (int, float)):
+                subscribers_int = int(subscribers_value)
+            else:
+                try:
+                    subscribers_int = int(str(subscribers_value).strip())
+                except (TypeError, ValueError):
+                    subscribers_int = None
+            if subscribers_int is not None:
+                metadata_payload["subscribers"] = subscribers_int
+
+        language_value = metadata.get("language")
+        if isinstance(language_value, str):
+            cleaned_language = language_value.strip()
+            if cleaned_language:
+                metadata_payload["language"] = cleaned_language
+
+        emails_value = metadata.get("emails")
+        normalized_emails: Optional[str] = None
+        if isinstance(emails_value, str):
+            cleaned_emails = emails_value.strip()
+            normalized_emails = cleaned_emails or None
+        elif isinstance(emails_value, (list, tuple, set)):
+            ordered_emails = [str(item).strip() for item in emails_value if str(item).strip()]
+            if ordered_emails:
+                unique_emails = list(dict.fromkeys(ordered_emails))
+                normalized_emails = ", ".join(unique_emails)
+        if normalized_emails:
+            metadata_payload["emails"] = normalized_emails
 
     with get_cursor() as cursor:
         cursor.execute(
@@ -358,10 +394,10 @@ def ensure_blacklisted_channel(
                 "channel_id": channel_id,
                 "name": resolved_name,
                 "url": canonical_url,
-                "subscribers": None,
-                "language": None,
+                "subscribers": metadata_payload.get("subscribers"),
+                "language": metadata_payload.get("language"),
                 "language_confidence": None,
-                "emails": None,
+                "emails": metadata_payload.get("emails"),
                 "last_updated": None,
                 "created_at": timestamp,
                 "last_attempted": None,
@@ -381,6 +417,12 @@ def ensure_blacklisted_channel(
                 status_reason=resolved_reason,
                 last_status_change=existing["last_status_change"] or timestamp,
             )
+            for field, value in metadata_payload.items():
+                if value is None:
+                    continue
+                existing_value = payload.get(field)
+                if existing_value in (None, ""):
+                    payload[field] = value
         _insert_or_replace(cursor, CHANNEL_TABLES[ChannelCategory.BLACKLISTED], payload)
         return updated, created
 
