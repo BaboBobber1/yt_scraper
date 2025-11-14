@@ -181,6 +181,20 @@ a:hover {
   gap: 12px;
 }
 
+.discover-runner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.discover-runner__counter {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
 .discover-toggles {
   display: flex;
   flex-wrap: wrap;
