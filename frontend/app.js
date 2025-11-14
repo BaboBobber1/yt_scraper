@@ -145,6 +145,11 @@ class Dashboard {
     this.eventSource = null;
     this.enrichmentBusy = false;
     this.filterDebounce = null;
+    this.discoveryLoopActive = false;
+    this.discoveryLoopStopping = false;
+    this.discoveryLoopStats = { runs: 0, found: 0 };
+    this.pendingAutoEnrich = 0;
+    this.autoEnrichQueuedNotified = false;
   }
 
   init() {
@@ -185,6 +190,10 @@ class Dashboard {
       discoverDenyLanguages: this.root.querySelector('#discoverDenyLanguages'),
       discoverLastUploadMaxAge: this.root.querySelector('#discoverLastUploadMaxAge'),
       discoverBtn: this.root.querySelector('#discoverBtn'),
+      discoverRunBtn: this.root.querySelector('#discoverRunBtn'),
+      discoverStopBtn: this.root.querySelector('#discoverStopBtn'),
+      discoverRunCounter: this.root.querySelector('#discoverRunCounter'),
+      discoverAutoEnrichToggle: this.root.querySelector('#discoverAutoEnrichToggle'),
       enrichBtn: this.root.querySelector('#enrichBtn'),
       enrichEmailBtn: this.root.querySelector('#enrichEmailBtn'),
       enrichLimit: this.root.querySelector('#enrichLimit'),
@@ -275,8 +284,21 @@ class Dashboard {
     this.el.exportCsvBtn.addEventListener('click', () => this.handleExportCsv());
 
     this.el.discoverBtn.addEventListener('click', () => this.handleDiscover());
+    this.el.discoverRunBtn?.addEventListener('click', () => this.startDiscoveryLoop());
+    this.el.discoverStopBtn?.addEventListener('click', () => this.stopDiscoveryLoop());
     this.el.enrichBtn.addEventListener('click', () => this.handleEnrich('full'));
     this.el.enrichEmailBtn.addEventListener('click', () => this.handleEnrich('email_only'));
+
+    this.el.discoverAutoEnrichToggle?.addEventListener('change', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement)) {
+        return;
+      }
+      if (!target.checked) {
+        this.pendingAutoEnrich = 0;
+        this.autoEnrichQueuedNotified = false;
+      }
+    });
 
     this.el.importBlacklistBtn.addEventListener('click', () => this.openModal());
     this.el.modalClose.addEventListener('click', () => this.closeModal());
@@ -869,55 +891,103 @@ class Dashboard {
       .filter(Boolean);
   }
 
-  async handleDiscover() {
+  collectDiscoveryInputs() {
     const keywords = this.parseKeywordsInput();
-    const perKeyword = Number(this.el.discoverPerKeyword.value) || 5;
+    if (!keywords.length) {
+      this.updateStatusBar('Please provide at least one keyword.', 'error');
+      return null;
+    }
+
+    const perKeywordRaw = Number(this.el.discoverPerKeyword.value);
+    const perKeyword =
+      Number.isNaN(perKeywordRaw) || perKeywordRaw <= 0 ? 5 : Math.max(1, Math.floor(perKeywordRaw));
+
     const denyLanguages = this.parseDenyLanguagesInput();
     const maxAgeRaw = this.el.discoverLastUploadMaxAge?.value ?? '';
     let lastUploadMaxAge = null;
-    if (maxAgeRaw.trim() !== '') {
+    if (typeof maxAgeRaw === 'string' && maxAgeRaw.trim() !== '') {
       const parsed = Number(maxAgeRaw);
       if (Number.isNaN(parsed) || parsed < 0) {
         this.updateStatusBar('Last upload max age must be zero or greater.', 'error');
-        return;
+        return null;
       }
       lastUploadMaxAge = Math.floor(parsed);
     }
-    if (!keywords.length) {
-      this.updateStatusBar('Please provide at least one keyword.', 'error');
-      return;
-    }
+
+    return {
+      keywords,
+      perKeyword,
+      denyLanguages,
+      lastUploadMaxAgeDays: lastUploadMaxAge,
+    };
+  }
+
+  async performDiscoveryRun(inputs, options = {}) {
+    const { statusLabel, deferStatusUpdate = false } = options;
+    const prefix = statusLabel ? `${statusLabel}: ` : '';
+    this.updateStatusBar(`${prefix}Starting discovery…`, 'info');
     try {
-      this.updateStatusBar('Starting discovery…', 'info');
-      const response = await discoverChannels(keywords, perKeyword, {
-        denyLanguages,
-        lastUploadMaxAgeDays: lastUploadMaxAge,
-      });
+      const requestOptions = {};
+      if (Array.isArray(inputs.denyLanguages) && inputs.denyLanguages.length) {
+        requestOptions.denyLanguages = inputs.denyLanguages;
+      }
+      if (inputs.lastUploadMaxAgeDays != null) {
+        requestOptions.lastUploadMaxAgeDays = inputs.lastUploadMaxAgeDays;
+      }
+      const response = await discoverChannels(inputs.keywords, inputs.perKeyword, requestOptions);
       let message = `Discovered ${response.found} new channels.`;
       if (response.blacklisted) {
         const suffix = response.blacklisted === 1 ? 'candidate' : 'candidates';
         message += ` Blacklisted ${response.blacklisted} ${suffix}.`;
       }
-      this.updateStatusBar(message, 'success');
+      if (!deferStatusUpdate) {
+        this.updateStatusBar(`${prefix}${message}`, 'success');
+      }
       await this.loadStats();
       await this.loadTable(Category.ACTIVE, (state) => ({ ...state, loading: true }));
+      await this.triggerAutoEnrich(response.found);
+      return { response, message };
     } catch (error) {
       console.error('Discovery failed', error);
-      this.updateStatusBar(error instanceof Error ? error.message : 'Discovery failed.', 'error');
+      const errorMessage = error instanceof Error ? error.message : 'Discovery failed.';
+      this.updateStatusBar(`${prefix}${errorMessage}`, 'error');
+      return null;
     }
   }
 
-  async handleEnrich(mode) {
+  async handleDiscover() {
+    if (this.discoveryLoopActive) {
+      this.updateStatusBar(
+        'Discovery loop is running. Stop it before starting a manual discovery.',
+        'info',
+      );
+      return;
+    }
+    const inputs = this.collectDiscoveryInputs();
+    if (!inputs) {
+      return;
+    }
+    await this.performDiscoveryRun(inputs);
+  }
+
+  async handleEnrich(mode, overrides = {}) {
     if (this.enrichmentBusy) {
       return;
     }
-    const limitValue = this.el.enrichLimit.value ? Number(this.el.enrichLimit.value) : null;
+    const { limitOverride = null, autoTriggered = false } = overrides;
+    let limitValue = null;
+    if (limitOverride != null) {
+      limitValue = Number(limitOverride);
+    } else if (this.el.enrichLimit.value) {
+      limitValue = Number(this.el.enrichLimit.value);
+    }
     if (limitValue != null && (Number.isNaN(limitValue) || limitValue <= 0)) {
       this.updateStatusBar('Enrichment limit must be a positive number.', 'error');
       return;
     }
     try {
       this.enrichmentBusy = true;
+      this.autoEnrichQueuedNotified = false;
       this.el.enrichBtn.disabled = true;
       this.el.enrichEmailBtn.disabled = true;
       this.renderTable();
@@ -926,7 +996,17 @@ class Dashboard {
         neverReenrich: this.el.enrichNeverToggle?.checked ?? false,
       };
       const { jobId, total, skipped = 0 } = await startEnrichment(mode, limitValue, options);
-      let message = `Enrichment job ${jobId} started.`;
+      let message;
+      if (autoTriggered) {
+        if (limitValue != null) {
+          const label = Math.abs(limitValue) === 1 ? 'channel' : 'channels';
+          message = `Auto-enrich job ${jobId} started for ${formatNumber(limitValue)} ${label}.`;
+        } else {
+          message = `Auto-enrich job ${jobId} started.`;
+        }
+      } else {
+        message = `Enrichment job ${jobId} started.`;
+      }
       if (skipped > 0) {
         const label = skipped === 1 ? 'channel' : 'channels';
         message += ` Skipped ${skipped} ${label} due to recent no-email results.`;
@@ -939,9 +1019,171 @@ class Dashboard {
       this.el.enrichBtn.disabled = false;
       this.el.enrichEmailBtn.disabled = false;
       this.renderTable();
+      if (autoTriggered && limitValue != null && limitValue > 0) {
+        this.pendingAutoEnrich += Number(limitValue);
+        this.autoEnrichQueuedNotified = false;
+      }
       console.error('Enrichment failed', error);
       this.updateStatusBar(error instanceof Error ? error.message : 'Failed to start enrichment.', 'error');
     }
+  }
+
+  isAutoEnrichEnabled() {
+    return Boolean(this.el.discoverAutoEnrichToggle?.checked);
+  }
+
+  async triggerAutoEnrich(newChannelsCount) {
+    const count = Number(newChannelsCount) || 0;
+    if (count <= 0) {
+      return;
+    }
+    if (!this.isAutoEnrichEnabled()) {
+      this.pendingAutoEnrich = 0;
+      return;
+    }
+    if (this.enrichmentBusy) {
+      this.pendingAutoEnrich += count;
+      if (!this.autoEnrichQueuedNotified) {
+        this.updateStatusBar('Auto-enrich queued until the current enrichment finishes.', 'info');
+        this.autoEnrichQueuedNotified = true;
+      }
+      return;
+    }
+    await this.handleEnrich('email_only', { limitOverride: count, autoTriggered: true });
+  }
+
+  async processPendingAutoEnrich() {
+    if (!this.pendingAutoEnrich || this.pendingAutoEnrich <= 0) {
+      this.pendingAutoEnrich = 0;
+      return;
+    }
+    if (!this.isAutoEnrichEnabled()) {
+      this.pendingAutoEnrich = 0;
+      return;
+    }
+    const queued = this.pendingAutoEnrich;
+    this.pendingAutoEnrich = 0;
+    this.autoEnrichQueuedNotified = false;
+    await this.triggerAutoEnrich(queued);
+  }
+
+  async startDiscoveryLoop() {
+    if (this.discoveryLoopActive) {
+      this.updateStatusBar('Discovery loop is already running.', 'info');
+      return;
+    }
+    const inputs = this.collectDiscoveryInputs();
+    if (!inputs) {
+      return;
+    }
+    this.discoveryLoopStats = { runs: 0, found: 0 };
+    this.discoveryLoopStopping = false;
+    this.setDiscoveryLoopRunningState(true);
+    this.updateDiscoveryLoopCounter();
+    this.updateStatusBar('Discovery loop started. Click stop to finish.', 'info');
+
+    let loopError = false;
+    try {
+      while (!this.discoveryLoopStopping) {
+        const runIndex = this.discoveryLoopStats.runs + 1;
+        const label = `Run #${runIndex}`;
+        const result = await this.performDiscoveryRun(inputs, {
+          statusLabel: label,
+          deferStatusUpdate: true,
+        });
+        if (!result) {
+          loopError = true;
+          break;
+        }
+        const { response, message } = result;
+        this.discoveryLoopStats.runs += 1;
+        this.discoveryLoopStats.found += Number(response?.found ?? 0);
+        this.updateDiscoveryLoopCounter();
+        const totalMessage = `${label}: ${message} Total discovered: ${formatNumber(
+          this.discoveryLoopStats.found,
+        )}.`;
+        this.updateStatusBar(totalMessage, 'success');
+        if (this.discoveryLoopStopping) {
+          break;
+        }
+        await this.delay(2000);
+        if (this.discoveryLoopStopping) {
+          break;
+        }
+      }
+    } finally {
+      const finalRuns = this.discoveryLoopStats.runs;
+      const finalFound = this.discoveryLoopStats.found;
+      this.discoveryLoopStopping = false;
+      this.setDiscoveryLoopRunningState(false);
+      this.updateDiscoveryLoopCounter();
+      if (!loopError) {
+        if (finalRuns > 0) {
+          const runLabel = finalRuns === 1 ? 'run' : 'runs';
+          const channelLabel = finalFound === 1 ? 'channel' : 'channels';
+          this.updateStatusBar(
+            `Discovery loop stopped after ${formatNumber(finalRuns)} ${runLabel} with ${formatNumber(finalFound)} new ${channelLabel}.`,
+            'info',
+          );
+        } else {
+          this.updateStatusBar('Discovery loop stopped.', 'info');
+        }
+      }
+    }
+  }
+
+  stopDiscoveryLoop() {
+    if (!this.discoveryLoopActive || this.discoveryLoopStopping) {
+      return;
+    }
+    this.discoveryLoopStopping = true;
+    if (this.el.discoverStopBtn) {
+      this.el.discoverStopBtn.disabled = true;
+    }
+    this.updateStatusBar('Stopping discovery after current run…', 'info');
+  }
+
+  setDiscoveryLoopRunningState(running) {
+    this.discoveryLoopActive = running;
+    if (this.el.discoverRunBtn) {
+      this.el.discoverRunBtn.disabled = running;
+    }
+    if (this.el.discoverBtn) {
+      this.el.discoverBtn.disabled = running;
+    }
+    if (this.el.discoverStopBtn) {
+      if (running) {
+        this.el.discoverStopBtn.removeAttribute('hidden');
+        this.el.discoverStopBtn.disabled = false;
+      } else {
+        this.el.discoverStopBtn.setAttribute('hidden', 'true');
+        this.el.discoverStopBtn.disabled = false;
+      }
+    }
+    if (this.el.discoverRunCounter) {
+      if (running) {
+        this.el.discoverRunCounter.removeAttribute('hidden');
+      } else {
+        this.el.discoverRunCounter.setAttribute('hidden', 'true');
+      }
+    }
+  }
+
+  updateDiscoveryLoopCounter() {
+    if (!this.el.discoverRunCounter) {
+      return;
+    }
+    const runs = this.discoveryLoopStats.runs;
+    const found = this.discoveryLoopStats.found;
+    const runLabel = runs === 1 ? 'Run' : 'Runs';
+    const channelLabel = found === 1 ? 'channel' : 'channels';
+    this.el.discoverRunCounter.textContent = `${runLabel}: ${formatNumber(runs)} • New ${channelLabel}: ${formatNumber(found)}`;
+  }
+
+  delay(ms) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 
   openEventSource(jobId, total) {
@@ -993,6 +1235,8 @@ class Dashboard {
             if (this.activeTab !== Category.ACTIVE) {
               await this.loadTable(this.activeTab, (state) => ({ ...state, loading: true }));
             }
+            this.autoEnrichQueuedNotified = false;
+            await this.processPendingAutoEnrich();
           }
         } else if (payload.type === 'error') {
           this.updateStatusBar(payload.message || 'Enrichment error encountered.', 'error');

@@ -60,9 +60,21 @@
           <button class="btn btn--green" id="exportCsvBtn"><span class="btn-icon">⬇️</span>Export CSV</button>
           <button class="btn btn--green" id="importBlacklistBtn"><span class="btn-icon">📥</span>Import blacklist (CSV)</button>
         </div>
+        <div class="discover-runner">
+          <button class="btn btn--outline" id="discoverRunBtn">
+            <span class="btn-icon">🔁</span>Run until stopped
+          </button>
+          <button class="btn btn--red" id="discoverStopBtn" hidden>
+            <span class="btn-icon">⏹️</span>Stop
+          </button>
+          <span class="discover-runner__counter" id="discoverRunCounter" hidden>
+            Runs: 0 • New channels: 0
+          </span>
+        </div>
         <div class="discover-toggles">
           <label class="discover-toggle"><input type="checkbox" id="enrichNeverToggle" /> Never re-enrich</label>
           <label class="discover-toggle"><input type="checkbox" id="enrichForceToggle" /> Force run</label>
+          <label class="discover-toggle"><input type="checkbox" id="discoverAutoEnrichToggle" /> Auto-enrich (email-only)</label>
         </div>
         <div class="status-container">
           <div class="status-bar" id="statusBar" hidden></div>
