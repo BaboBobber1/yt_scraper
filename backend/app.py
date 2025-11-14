@@ -612,6 +612,21 @@ def api_archive_bulk(
     return JSONResponse({"archived": len(archived_ids), "archivedIds": archived_ids, "archivedAt": timestamp})
 
 
+@app.post("/api/channels/archive_exported")
+def api_archive_exported(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON object")
+
+    exported_at_raw = payload.get("exported_at")
+    if not isinstance(exported_at_raw, str) or not exported_at_raw.strip():
+        raise HTTPException(status_code=400, detail="exported_at must be provided")
+
+    exported_at = exported_at_raw.strip()
+    timestamp = dt.datetime.utcnow().isoformat()
+    archived_ids = database.archive_channels_by_exported_at(exported_at, timestamp)
+    return JSONResponse({"archived": len(archived_ids), "archivedIds": archived_ids, "archivedAt": timestamp})
+
+
 @app.post("/api/channels/{channel_id}/blacklist")
 def api_blacklist_channel(channel_id: str, category: Optional[str] = Query(default=None)) -> JSONResponse:
     timestamp = dt.datetime.utcnow().isoformat()
@@ -891,7 +906,8 @@ def api_export_csv(
             )
         except Exception as exc:  # pragma: no cover - defensive
             raise HTTPException(status_code=500, detail="Failed to update exported rows") from exc
-    return PlainTextResponse(content=csv_data, media_type="text/csv; charset=utf-8")
+    headers = {"X-Export-Timestamp": export_timestamp}
+    return PlainTextResponse(content=csv_data, media_type="text/csv; charset=utf-8", headers=headers)
 
 
 @app.get("/api/stats")
