@@ -19,42 +19,22 @@
       </header>
 
       <section class="discover-panel">
-        <div class="discover-grid">
-          <div class="discover-field">
-            <label for="discoverKeywords">Discovery keywords</label>
-            <textarea
-              id="discoverKeywords"
-              rows="4"
-              spellcheck="false"
-            >crypto, bitcoin, ethereum, defi, altcoin, memecoin, onchain, crypto trading</textarea>
+        <div class="discover-controls">
+          <div class="discover-primary">
+            <button class="btn btn--green btn--xl" id="discoverBtn" type="button">
+              <span class="btn-icon">🔍</span>
+              Discover
+            </button>
+            <button class="btn btn--ghost" id="discoverSettingsBtn" type="button">
+              <span class="btn-icon">⚙️</span>
+              Discover settings
+            </button>
           </div>
-          <div class="discover-field discover-field--small">
-            <label for="discoverPerKeyword">Per keyword</label>
-            <input type="number" id="discoverPerKeyword" min="1" value="5" />
-            <label for="enrichLimit">Enrich limit (optional)</label>
-            <input type="number" id="enrichLimit" min="1" placeholder="No limit" />
-          </div>
-          <div class="discover-field">
-            <label for="discoverDenyLanguages">Deny languages</label>
-            <input
-              type="text"
-              id="discoverDenyLanguages"
-              placeholder="e.g. de, fr, ru"
-              spellcheck="false"
-            />
-          </div>
-          <div class="discover-field discover-field--small">
-            <label for="discoverLastUploadMaxAge">Last upload max age (days)</label>
-            <input
-              type="number"
-              id="discoverLastUploadMaxAge"
-              min="0"
-              placeholder="No limit"
-            />
-          </div>
+          <p class="discover-summary" id="discoverSummary">
+            Configure discovery keywords and filters to get started.
+          </p>
         </div>
-        <div class="discover-actions">
-          <button class="btn btn--green" id="discoverBtn"><span class="btn-icon">🔍</span>Discover</button>
+        <div class="discover-utilities">
           <button class="btn btn--green" id="enrichBtn"><span class="btn-icon">⚙️</span>Enrich</button>
           <button class="btn btn--green" id="enrichEmailBtn"><span class="btn-icon">✉️</span>Enrich (Email-only)</button>
           <button class="btn btn--green" id="exportCsvBtn"><span class="btn-icon">⬇️</span>Export CSV</button>
@@ -62,11 +42,8 @@
           <button class="btn btn--green" id="importBlacklistBtn"><span class="btn-icon">📥</span>Import blacklist (CSV)</button>
         </div>
         <div class="discover-runner">
-          <button class="btn btn--outline" id="discoverRunBtn">
-            <span class="btn-icon">🔁</span>Run until stopped
-          </button>
           <button class="btn btn--red" id="discoverStopBtn" hidden>
-            <span class="btn-icon">⏹️</span>Stop
+            <span class="btn-icon">⏹️</span>Stop discovery loop
           </button>
           <span class="discover-runner__counter" id="discoverRunCounter" hidden>
             Runs: 0 • New channels: 0
@@ -75,7 +52,6 @@
         <div class="discover-toggles">
           <label class="discover-toggle"><input type="checkbox" id="enrichNeverToggle" /> Never re-enrich</label>
           <label class="discover-toggle"><input type="checkbox" id="enrichForceToggle" /> Force run</label>
-          <label class="discover-toggle"><input type="checkbox" id="discoverAutoEnrichToggle" /> Auto-enrich (email-only)</label>
         </div>
         <div class="status-container">
           <div class="status-bar" id="statusBar" hidden></div>
@@ -186,6 +162,81 @@
           <button class="btn btn--outline" id="nextPageBtn">Next →</button>
         </div>
       </section>
+    </div>
+
+    <div class="modal" id="discoverSettingsModal" hidden>
+      <div
+        class="modal-content modal-content--wide"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="discoverSettingsTitle"
+      >
+        <div class="modal-header">
+          <h2 id="discoverSettingsTitle">Discover settings</h2>
+          <button type="button" class="modal-close" id="discoverSettingsCloseBtn" aria-label="Close">×</button>
+        </div>
+        <form class="modal-body discover-modal-body" id="discoverSettingsForm">
+          <section class="modal-section">
+            <h3 class="modal-section__title">Keywords</h3>
+            <div class="modal-field">
+              <label for="discoverKeywords">Discovery keywords</label>
+              <textarea id="discoverKeywords" rows="6" spellcheck="false"></textarea>
+              <p class="modal-hint">Enter one keyword per line or separate them with commas.</p>
+            </div>
+          </section>
+          <section class="modal-section">
+            <h3 class="modal-section__title">Limits &amp; filters</h3>
+            <div class="modal-grid">
+              <div class="modal-field">
+                <label for="discoverPerKeyword">Per keyword</label>
+                <input type="number" id="discoverPerKeyword" min="1" />
+              </div>
+              <div class="modal-field">
+                <label for="discoverLastUploadMaxAge">Last upload max age (days)</label>
+                <input type="number" id="discoverLastUploadMaxAge" min="0" placeholder="No limit" />
+              </div>
+              <div class="modal-field modal-field--full">
+                <label for="discoverDenyLanguages">Deny languages</label>
+                <input
+                  type="text"
+                  id="discoverDenyLanguages"
+                  placeholder="e.g. de, fr, ru"
+                  spellcheck="false"
+                />
+                <p class="modal-hint">Comma separated language codes. Leave blank to allow all.</p>
+              </div>
+            </div>
+          </section>
+          <section class="modal-section">
+            <h3 class="modal-section__title">Automation</h3>
+            <div class="modal-switches">
+              <label class="modal-toggle">
+                <input type="checkbox" id="discoverRunUntilStopped" /> Run until stopped
+              </label>
+              <div class="modal-field modal-field--inline">
+                <label class="modal-toggle">
+                  <input type="checkbox" id="discoverAutoEnrichToggle" /> Auto-enrich discovered channels
+                </label>
+                <select id="discoverAutoEnrichMode">
+                  <option value="email_only">Email only</option>
+                  <option value="full">Normal</option>
+                </select>
+                <p class="modal-hint">Choose how auto-enrich runs after each discovery.</p>
+              </div>
+              <div class="modal-field">
+                <label for="enrichLimit">Enrich limit (optional)</label>
+                <input type="number" id="enrichLimit" min="1" placeholder="No limit" />
+              </div>
+            </div>
+          </section>
+        </form>
+        <div class="modal-footer">
+          <button type="button" class="btn btn--outline" id="discoverSettingsCancelBtn">Cancel</button>
+          <button type="submit" form="discoverSettingsForm" class="btn btn--green" id="discoverSettingsStartBtn">
+            <span class="btn-icon">🔍</span>Start discover
+          </button>
+        </div>
+      </div>
     </div>
 
     <div class="modal" id="blacklistModal" hidden>
