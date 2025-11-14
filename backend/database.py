@@ -1002,6 +1002,418 @@ def _build_global_email_index(
     return dict(sorted(index.items(), key=lambda item: item[0]))
 
 
+def _coerce_optional_int(value: Any, *, default: Optional[int] = None) -> Optional[int]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return default
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return default
+        try:
+            return int(candidate)
+        except ValueError:
+            return default
+    return default
+
+
+def _coerce_flag(value: Any, *, default: Optional[int] = None) -> Optional[int]:
+    result = _coerce_optional_int(value, default=default)
+    if result is None:
+        return default
+    return 1 if result else 0
+
+
+def _normalize_bundle_channel_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    channel_id_raw = record.get("channel_id")
+    channel_id = str(channel_id_raw).strip() if channel_id_raw is not None else ""
+    if not channel_id:
+        raise ValueError("channel record missing channel_id")
+
+    normalized: Dict[str, Any] = {column: record.get(column) for column in CHANNEL_COLUMNS}
+    normalized["channel_id"] = channel_id
+    normalized["url"] = ensure_channel_url(channel_id, record.get("url"))
+    normalized["subscribers"] = _coerce_optional_int(record.get("subscribers"))
+    normalized["email_gate_present"] = _coerce_flag(record.get("email_gate_present"))
+    normalized["needs_enrichment"] = _coerce_flag(record.get("needs_enrichment"), default=1)
+    status = record.get("status")
+    normalized["status"] = (status or "new").strip() or "new"
+    if not normalized.get("created_at"):
+        fallback_created = (
+            record.get("last_updated")
+            or record.get("last_status_change")
+            or record.get("archived_at")
+            or record.get("exported_at")
+        )
+        normalized["created_at"] = fallback_created
+    return normalized
+
+
+def restore_project_bundle(
+    data: Dict[str, Any],
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Bundle data must be an object")
+
+    if meta and isinstance(meta, dict):
+        schema_version = meta.get("schemaVersion")
+        if isinstance(schema_version, (int, float)) and int(schema_version) > PROJECT_BUNDLE_SCHEMA_VERSION:
+            raise ValueError(
+                "Bundle schema version is newer than supported version"
+            )
+
+    channels_payload = data.get("channels")
+    if not isinstance(channels_payload, dict):
+        raise ValueError("Bundle data is missing channel collections")
+
+    blacklist_payload = data.get("blacklist") or []
+    emails_unique_payload = data.get("emails_unique") or []
+    channel_emails_payload = data.get("channel_emails") or []
+
+    with get_cursor() as cursor:
+        current_channels: Dict[str, Dict[str, Any]] = {}
+        for category, table in CHANNEL_TABLES.items():
+            cursor.execute(f"SELECT * FROM {table}")
+            for row in cursor.fetchall():
+                record = {column: row[column] for column in CHANNEL_COLUMNS}
+                current_channels[row["channel_id"]] = {
+                    "category": category,
+                    "data": record,
+                }
+
+        cursor.execute("SELECT * FROM blacklist")
+        current_blacklist = {
+            row["channel_id"]: {
+                "channel_id": row["channel_id"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in cursor.fetchall()
+            if row["channel_id"]
+        }
+
+        cursor.execute("SELECT * FROM emails_unique")
+        current_emails_unique = {
+            row["email"]: {
+                "email": row["email"],
+                "first_seen_channel_id": row["first_seen_channel_id"],
+                "last_seen_at": row["last_seen_at"],
+            }
+            for row in cursor.fetchall()
+            if row["email"]
+        }
+
+        cursor.execute("SELECT * FROM channel_emails")
+        current_channel_emails = {
+            (row["channel_id"], row["email"]): {
+                "channel_id": row["channel_id"],
+                "email": row["email"],
+                "last_seen_at": row["last_seen_at"],
+            }
+            for row in cursor.fetchall()
+            if row["channel_id"] and row["email"]
+        }
+
+    channel_summary: Dict[str, Dict[str, int]] = {
+        category.value: {
+            "inserted": 0,
+            "updated": 0,
+            "movedIn": 0,
+            "movedOut": 0,
+            "unchanged": 0,
+            "skipped": 0,
+        }
+        for category in ChannelCategory
+    }
+    channel_actions: List[Dict[str, Any]] = []
+
+    for category_name, records in channels_payload.items():
+        try:
+            category = ChannelCategory(category_name)
+        except ValueError as exc:
+            raise ValueError(f"Unknown channel category: {category_name}") from exc
+
+        if not isinstance(records, list):
+            raise ValueError(f"Channel list for {category.value} must be an array")
+
+        seen_ids: Set[str] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                channel_summary[category.value]["skipped"] += 1
+                continue
+            try:
+                normalized = _normalize_bundle_channel_record(record)
+            except ValueError:
+                channel_summary[category.value]["skipped"] += 1
+                continue
+
+            channel_id = normalized["channel_id"]
+            if channel_id in seen_ids:
+                continue
+            seen_ids.add(channel_id)
+
+            existing = current_channels.get(channel_id)
+            if not existing:
+                channel_summary[category.value]["inserted"] += 1
+                channel_actions.append(
+                    {
+                        "channel_id": channel_id,
+                        "category": category,
+                        "data": dict(normalized),
+                        "delete_from": None,
+                    }
+                )
+                current_channels[channel_id] = {
+                    "category": category,
+                    "data": dict(normalized),
+                }
+                continue
+
+            existing_category = existing["category"]
+            existing_data = existing["data"]
+            needs_update = normalized != existing_data or existing_category is not category
+
+            if existing_category is not category:
+                channel_summary[category.value]["movedIn"] += 1
+                channel_summary[existing_category.value]["movedOut"] += 1
+            elif needs_update:
+                channel_summary[category.value]["updated"] += 1
+            else:
+                channel_summary[category.value]["unchanged"] += 1
+                continue
+
+            channel_actions.append(
+                {
+                    "channel_id": channel_id,
+                    "category": category,
+                    "data": dict(normalized),
+                    "delete_from": existing_category if existing_category is not category else None,
+                }
+            )
+            current_channels[channel_id] = {
+                "category": category,
+                "data": dict(normalized),
+            }
+
+    blacklist_summary = {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+    blacklist_actions: List[Dict[str, Any]] = []
+
+    for entry in blacklist_payload:
+        if not isinstance(entry, dict):
+            blacklist_summary["skipped"] += 1
+            continue
+        channel_id_raw = entry.get("channel_id")
+        channel_id = str(channel_id_raw).strip() if channel_id_raw is not None else ""
+        if not channel_id:
+            blacklist_summary["skipped"] += 1
+            continue
+        created_at = entry.get("created_at")
+        updated_at = entry.get("updated_at") or created_at
+        normalized = {
+            "channel_id": channel_id,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        existing = current_blacklist.get(channel_id)
+        if not existing:
+            blacklist_summary["inserted"] += 1
+            blacklist_actions.append(normalized)
+        elif existing != normalized:
+            blacklist_summary["updated"] += 1
+            blacklist_actions.append(normalized)
+        else:
+            blacklist_summary["unchanged"] += 1
+        current_blacklist[channel_id] = normalized
+
+    email_unique_summary = {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+    email_relation_summary = {
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped": 0,
+        "autoCreatedUnique": 0,
+    }
+    email_unique_actions: List[Dict[str, Any]] = []
+    channel_email_actions: List[Dict[str, Any]] = []
+
+    seen_unique: Set[str] = set()
+    for entry in emails_unique_payload:
+        if not isinstance(entry, dict):
+            email_unique_summary["skipped"] += 1
+            continue
+        email_raw = entry.get("email")
+        email = _normalize_email(email_raw) if email_raw else None
+        if not email:
+            email_unique_summary["skipped"] += 1
+            continue
+        if email in seen_unique:
+            continue
+        seen_unique.add(email)
+        normalized = {
+            "email": email,
+            "first_seen_channel_id": entry.get("first_seen_channel_id"),
+            "last_seen_at": entry.get("last_seen_at"),
+        }
+        existing = current_emails_unique.get(email)
+        if not existing:
+            email_unique_summary["inserted"] += 1
+            email_unique_actions.append(normalized)
+        elif existing != normalized:
+            email_unique_summary["updated"] += 1
+            email_unique_actions.append(normalized)
+        else:
+            email_unique_summary["unchanged"] += 1
+        current_emails_unique[email] = normalized
+
+    seen_relations: Set[Tuple[str, str]] = set()
+    for entry in channel_emails_payload:
+        if not isinstance(entry, dict):
+            email_relation_summary["skipped"] += 1
+            continue
+        channel_id_raw = entry.get("channel_id")
+        channel_id = str(channel_id_raw).strip() if channel_id_raw is not None else ""
+        email_raw = entry.get("email")
+        email = _normalize_email(email_raw) if email_raw else None
+        if not channel_id or not email:
+            email_relation_summary["skipped"] += 1
+            continue
+        key = (channel_id, email)
+        if key in seen_relations:
+            continue
+        seen_relations.add(key)
+        last_seen_at = entry.get("last_seen_at")
+        normalized = {
+            "channel_id": channel_id,
+            "email": email,
+            "last_seen_at": last_seen_at,
+        }
+        existing_relation = current_channel_emails.get(key)
+        if not existing_relation:
+            email_relation_summary["inserted"] += 1
+            channel_email_actions.append(normalized)
+        elif existing_relation != normalized:
+            email_relation_summary["updated"] += 1
+            channel_email_actions.append(normalized)
+        else:
+            email_relation_summary["unchanged"] += 1
+        current_channel_emails[key] = normalized
+
+        if email not in current_emails_unique:
+            inferred_unique = {
+                "email": email,
+                "first_seen_channel_id": channel_id,
+                "last_seen_at": last_seen_at,
+            }
+            current_emails_unique[email] = inferred_unique
+            email_unique_actions.append(inferred_unique)
+            email_unique_summary["inserted"] += 1
+            email_relation_summary["autoCreatedUnique"] += 1
+
+    delete_map: Dict[ChannelCategory, Set[str]] = {category: set() for category in ChannelCategory}
+    if not dry_run:
+        with get_cursor() as cursor:
+            for action in channel_actions:
+                _insert_or_replace(cursor, CHANNEL_TABLES[action["category"]], action["data"])
+                source_category = action.get("delete_from")
+                if source_category:
+                    delete_map[source_category].add(action["channel_id"])
+
+            for source_category, ids in delete_map.items():
+                if not ids:
+                    continue
+                placeholders = ",".join("?" for _ in ids)
+                cursor.execute(
+                    f"DELETE FROM {CHANNEL_TABLES[source_category]} WHERE channel_id IN ({placeholders})",
+                    list(ids),
+                )
+
+            for entry in blacklist_actions:
+                cursor.execute(
+                    """
+                    INSERT INTO blacklist (channel_id, created_at, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(channel_id) DO UPDATE SET
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (entry["channel_id"], entry.get("created_at"), entry.get("updated_at")),
+                )
+
+            for entry in email_unique_actions:
+                cursor.execute(
+                    """
+                    INSERT INTO emails_unique (email, first_seen_channel_id, last_seen_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(email) DO UPDATE SET
+                        first_seen_channel_id = excluded.first_seen_channel_id,
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        entry["email"],
+                        entry.get("first_seen_channel_id"),
+                        entry.get("last_seen_at"),
+                    ),
+                )
+
+            for entry in channel_email_actions:
+                cursor.execute(
+                    """
+                    INSERT INTO channel_emails (channel_id, email, last_seen_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(channel_id, email) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        entry["channel_id"],
+                        entry["email"],
+                        entry.get("last_seen_at"),
+                    ),
+                )
+
+    channel_counts: Dict[str, int] = {category.value: 0 for category in ChannelCategory}
+    for info in current_channels.values():
+        channel_counts[info["category"].value] += 1
+
+    email_index = _build_global_email_index(
+        list(current_channel_emails.values()),
+        list(current_emails_unique.values()),
+    )
+
+    summary = {
+        "dryRun": dry_run,
+        "channelSummary": channel_summary,
+        "channelCounts": channel_counts,
+        "blacklistSummary": blacklist_summary,
+        "emailSummary": {
+            "unique": email_unique_summary,
+            "relations": email_relation_summary,
+        },
+        "globalEmailIndex": email_index,
+    }
+
+    if meta and isinstance(meta, dict):
+        summary["meta"] = {
+            "schemaVersion": meta.get("schemaVersion"),
+            "bundleExportedAt": meta.get("exportedAt"),
+        }
+    else:
+        summary["meta"] = {
+            "schemaVersion": PROJECT_BUNDLE_SCHEMA_VERSION,
+            "bundleExportedAt": None,
+        }
+
+    return summary
+
+
 def restore_channels_by_ids(
     channel_ids: Sequence[str],
     timestamp: str,
