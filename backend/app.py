@@ -664,6 +664,7 @@ def api_export_csv(
     unique_emails: bool = Query(default=False),
     email_gate_only: bool = Query(default=False),
     category: Optional[str] = Query(default=ChannelCategory.ACTIVE.value),
+    archive_exported: bool = Query(default=False),
 ) -> PlainTextResponse:
     category_value = _parse_category(category)
     filters = _collect_filters(
@@ -679,6 +680,9 @@ def api_export_csv(
     buffer = io.StringIO()
     writer = csv.writer(buffer)
 
+    exported_channel_ids: List[str] = []
+    export_timestamp = dt.datetime.utcnow().isoformat()
+
     if emails_only and unique_emails:
         rows = database.get_unique_email_rows(filters, category=category_value)
         writer.writerow(
@@ -691,6 +695,9 @@ def api_export_csv(
             ]
         )
         for row in rows:
+            channel_id = row.get("primary_channel_id")
+            if channel_id:
+                exported_channel_ids.append(channel_id)
             writer.writerow(
                 [
                     row.get("email", ""),
@@ -722,10 +729,15 @@ def api_export_csv(
                 "Last Status Change",
                 "Created At",
                 "Last Attempted",
+                "Exported At",
+                "Archived At",
                 "Error Reason",
             ]
         )
         for item in items:
+            channel_id = item.get("channel_id")
+            if channel_id:
+                exported_channel_ids.append(channel_id)
             writer.writerow(
                 [
                     item.get("name") or "",
@@ -741,11 +753,23 @@ def api_export_csv(
                     item.get("last_status_change") or "",
                     item.get("created_at") or "",
                     item.get("last_attempted") or "",
+                    item.get("exported_at") or "",
+                    item.get("archived_at") or "",
                     item.get("status_reason") or item.get("last_error") or "",
                 ]
             )
 
     csv_data = buffer.getvalue()
+    if exported_channel_ids:
+        try:
+            database.mark_channels_exported(
+                category_value,
+                exported_channel_ids,
+                export_timestamp,
+                archive=archive_exported,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            raise HTTPException(status_code=500, detail="Failed to update exported rows") from exc
     return PlainTextResponse(content=csv_data, media_type="text/csv; charset=utf-8")
 
 

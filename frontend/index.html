@@ -46,6 +46,9 @@
           <label class="discover-toggle"><input type="checkbox" id="enrichNeverToggle" /> Never re-enrich</label>
           <label class="discover-toggle"><input type="checkbox" id="enrichForceToggle" /> Force run</label>
         </div>
+        <div class="discover-toggles">
+          <label class="discover-toggle"><input type="checkbox" id="exportArchiveToggle" /> Mark exported rows as archived</label>
+        </div>
         <div class="status-container">
           <div class="status-bar" id="statusBar" hidden></div>
           <div class="status-bar status-bar--info" id="progressBar" hidden></div>
@@ -114,6 +117,8 @@
               <option value="subscribers">Subscribers</option>
               <option value="language">Language</option>
               <option value="last_updated">Last updated</option>
+              <option value="exported_at">Exported</option>
+              <option value="archived_at">Archived</option>
               <option value="status">Status</option>
               <option value="last_status_change">Status change</option>
             </select>
@@ -135,12 +140,14 @@
                 <th>Emails</th>
                 <th>Status</th>
                 <th>Last updated</th>
+                <th>Exported</th>
+                <th>Archived</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody id="tableBody">
               <tr>
-                <td colspan="7" class="table-loading">Loading channels…</td>
+                <td colspan="9" class="table-loading">Loading channels…</td>
               </tr>
             </tbody>
           </table>
