@@ -68,6 +68,51 @@ def _parse_int(value: Optional[str], *, field: str) -> Optional[int]:
         raise HTTPException(status_code=400, detail=f"{field} must be an integer")
 
 
+def _unwrap_single_value(value: Any) -> Any:
+    if isinstance(value, list):
+        for candidate in value:
+            unwrapped = _unwrap_single_value(candidate)
+            if unwrapped not in (None, ""):
+                return unwrapped
+        return None
+    return value
+
+
+def _parse_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    candidate = candidate.replace(",", "").replace("_", "")
+    if candidate.endswith("+"):
+        candidate = candidate[:-1]
+    if not candidate:
+        return None
+    multiplier_map = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+    suffix = candidate[-1].lower()
+    multiplier = multiplier_map.get(suffix)
+    if multiplier:
+        candidate = candidate[:-1]
+        try:
+            return int(float(candidate) * multiplier)
+        except ValueError:
+            return None
+    try:
+        return int(candidate)
+    except ValueError:
+        try:
+            return int(float(candidate))
+        except ValueError:
+            return None
+
+
 def _collect_filters(
     *,
     q: Optional[str],
@@ -160,11 +205,15 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     new_channels: List[Dict[str, Any]] = []
     blacklisted_candidates = 0
 
-    max_age_value = payload.get("last_upload_max_age_days")
-    if max_age_value is None:
-        max_age_value = payload.get("lastUploadMaxAgeDays")
+    max_age_value = _unwrap_single_value(payload.get("last_upload_max_age_days"))
+    if max_age_value in (None, ""):
+        max_age_value = _unwrap_single_value(payload.get("lastUploadMaxAgeDays"))
+    if isinstance(max_age_value, str):
+        max_age_value = max_age_value.strip()
+    if max_age_value == "":
+        max_age_value = None
     last_upload_max_age_days: Optional[int] = None
-    if max_age_value not in {None, "", []}:
+    if max_age_value is not None:
         try:
             last_upload_max_age_days = int(max_age_value)
         except (TypeError, ValueError):
@@ -343,6 +392,23 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
             for key, value in row.items()
             if key
         }
+        metadata: Dict[str, Any] = {}
+        csv_subscribers = normalized.get("subscribers") or normalized.get("subscriber_count")
+        subscribers_value = _parse_optional_int(csv_subscribers)
+        if subscribers_value is not None:
+            metadata["subscribers"] = subscribers_value
+        csv_language = normalized.get("language")
+        if csv_language:
+            metadata["language"] = csv_language
+        csv_emails = normalized.get("emails") or normalized.get("email")
+        if csv_emails:
+            parsed_emails = database.parse_email_candidates(csv_emails)
+            if parsed_emails:
+                unique_emails = list(dict.fromkeys(email.strip() for email in parsed_emails if email.strip()))
+                if unique_emails:
+                    metadata["emails"] = ", ".join(unique_emails)
+            elif csv_emails:
+                metadata["emails"] = csv_emails
         source_column = "channel_id" if normalized.get("channel_id") else "url"
         candidate_value = normalized.get(source_column) or normalized.get("url") or ""
         row_number = reader.line_num
@@ -427,6 +493,7 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
             timestamp,
             url=resolution.canonical_url,
             name=resolution.title or resolution.handle,
+            metadata=metadata,
         )
         record = {
             "channel_id": channel_id,
@@ -434,6 +501,12 @@ async def api_blacklist_import(file: UploadFile = File(...)) -> JSONResponse:
             "handle": resolution.handle,
             "name": resolution.title or resolution.handle,
         }
+        if metadata.get("subscribers") is not None:
+            record["subscribers"] = metadata["subscribers"]
+        if metadata.get("language"):
+            record["language"] = metadata["language"]
+        if metadata.get("emails"):
+            record["emails"] = metadata["emails"]
         if moved:
             updated.append(record)
         else:
