@@ -219,6 +219,8 @@ class Dashboard {
       enrichBtn: this.root.querySelector('#enrichBtn'),
       enrichEmailBtn: this.root.querySelector('#enrichEmailBtn'),
       enrichLimit: this.root.querySelector('#enrichLimit'),
+      enrichForceToggle: this.root.querySelector('#enrichForceToggle'),
+      enrichNeverToggle: this.root.querySelector('#enrichNeverToggle'),
       importBlacklistBtn: this.root.querySelector('#importBlacklistBtn'),
       modal: document.getElementById('blacklistModal'),
       modalClose: document.getElementById('blacklistCloseBtn'),
@@ -875,8 +877,17 @@ class Dashboard {
       this.el.enrichBtn.disabled = true;
       this.el.enrichEmailBtn.disabled = true;
       this.renderTable();
-      const { jobId, total } = await startEnrichment(mode, limitValue);
-      this.updateStatusBar(`Enrichment job ${jobId} started.`, 'success');
+      const options = {
+        forceRun: this.el.enrichForceToggle?.checked ?? false,
+        neverReenrich: this.el.enrichNeverToggle?.checked ?? false,
+      };
+      const { jobId, total, skipped = 0 } = await startEnrichment(mode, limitValue, options);
+      let message = `Enrichment job ${jobId} started.`;
+      if (skipped > 0) {
+        const label = skipped === 1 ? 'channel' : 'channels';
+        message += ` Skipped ${skipped} ${label} due to recent no-email results.`;
+      }
+      this.updateStatusBar(message, 'success');
       this.setSummary('', 'info');
       this.openEventSource(jobId, total);
     } catch (error) {
@@ -915,7 +926,24 @@ class Dashboard {
             this.el.enrichBtn.disabled = false;
             this.el.enrichEmailBtn.disabled = false;
             this.setProgress('');
-            this.setSummary('Enrichment job completed.', 'success');
+            const skipped = payload.skipped ?? 0;
+            const requested = payload.requested;
+            let summary = 'Enrichment job completed.';
+            if (typeof requested === 'number') {
+              summary += ` Processed ${completed} of ${requested} channels.`;
+            }
+            if (skipped > 0) {
+              const label = skipped === 1 ? 'channel' : 'channels';
+              summary += ` Skipped ${skipped} ${label} due to recent no-email results.`;
+            }
+            this.setSummary(summary, 'success');
+            if (skipped > 0) {
+              const label = skipped === 1 ? 'channel' : 'channels';
+              this.updateStatusBar(
+                `Skipped ${skipped} ${label} because they were recently enriched without emails.`,
+                'info'
+              );
+            }
             await this.loadStats();
             await this.loadTable(Category.ACTIVE, (state) => ({ ...state, loading: true }));
             if (this.activeTab !== Category.ACTIVE) {

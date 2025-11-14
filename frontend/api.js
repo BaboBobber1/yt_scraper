@@ -114,10 +114,15 @@ export async function discoverChannels(keywords, perKeyword) {
   });
 }
 
-export async function startEnrichment(mode, limit) {
+export async function startEnrichment(mode, limit, options = {}) {
   return request('/api/enrich', {
     method: 'POST',
-    body: JSON.stringify({ mode, limit: limit ?? null }),
+    body: JSON.stringify({
+      mode,
+      limit: limit ?? null,
+      forceRun: Boolean(options.forceRun),
+      neverReenrich: Boolean(options.neverReenrich),
+    }),
   });
 }
 
