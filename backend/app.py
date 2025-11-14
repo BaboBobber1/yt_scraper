@@ -4,6 +4,8 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
+import json
+import zipfile
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
@@ -908,6 +910,46 @@ def api_export_csv(
             raise HTTPException(status_code=500, detail="Failed to update exported rows") from exc
     headers = {"X-Export-Timestamp": export_timestamp}
     return PlainTextResponse(content=csv_data, media_type="text/csv; charset=utf-8", headers=headers)
+
+
+@app.get("/api/export/bundle")
+def api_export_bundle() -> StreamingResponse:
+    data, email_index = database.fetch_project_bundle_data()
+    export_timestamp = dt.datetime.utcnow().replace(microsecond=0).isoformat()
+
+    channel_counts = {
+        category: len(records) for category, records in data.get("channels", {}).items()
+    }
+    meta = {
+        "schemaVersion": database.PROJECT_BUNDLE_SCHEMA_VERSION,
+        "exportedAt": export_timestamp,
+        "channelCounts": channel_counts,
+        "blacklistCount": len(data.get("blacklist", [])),
+        "emailRelations": {
+            "uniqueEmails": len(data.get("emails_unique", [])),
+            "channelEmailLinks": len(data.get("channel_emails", [])),
+        },
+        "globalEmailIndex": email_index,
+    }
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr(
+            "data.json",
+            json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True),
+        )
+        bundle.writestr(
+            "meta.json",
+            json.dumps(meta, indent=2, ensure_ascii=False, sort_keys=True),
+        )
+
+    buffer.seek(0)
+    filename = f"project-bundle-{export_timestamp.replace(':', '').replace('T', '_')}.zip"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Export-Timestamp": export_timestamp,
+    }
+    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
 
 
 @app.get("/api/stats")

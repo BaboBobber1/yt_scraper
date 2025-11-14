@@ -52,6 +52,8 @@ CHANNEL_TABLES = {
     ChannelCategory.BLACKLISTED: "channels_blacklisted",
 }
 
+PROJECT_BUNDLE_SCHEMA_VERSION = 1
+
 CHANNEL_COLUMNS = [
     "channel_id",
     "name",
@@ -922,6 +924,82 @@ def mark_channels_exported(
     if archive and category is ChannelCategory.ACTIVE:
         archived = archive_channels_by_ids(unique_ids, timestamp)
     return archived
+
+
+def fetch_project_bundle_data() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return a complete snapshot of the project for bundle exports."""
+
+    with get_cursor() as cursor:
+        channels: Dict[str, List[Dict[str, Any]]] = {}
+        for category, table in CHANNEL_TABLES.items():
+            cursor.execute(f"SELECT * FROM {table} ORDER BY created_at ASC")
+            channels[category.value] = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("SELECT * FROM blacklist ORDER BY updated_at DESC, created_at DESC")
+        blacklist_rows = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            "SELECT * FROM emails_unique ORDER BY last_seen_at DESC, first_seen_channel_id ASC"
+        )
+        emails_unique = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            "SELECT * FROM channel_emails ORDER BY last_seen_at DESC, email ASC, channel_id ASC"
+        )
+        channel_emails = [dict(row) for row in cursor.fetchall()]
+
+    email_index = _build_global_email_index(channel_emails, emails_unique)
+
+    data = {
+        "channels": channels,
+        "blacklist": blacklist_rows,
+        "emails_unique": emails_unique,
+        "channel_emails": channel_emails,
+    }
+
+    return data, email_index
+
+
+def _build_global_email_index(
+    channel_emails: Sequence[Dict[str, Any]],
+    emails_unique: Sequence[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Construct a global index of email addresses and related channels."""
+
+    index: Dict[str, Dict[str, Any]] = {}
+
+    for relation in channel_emails:
+        email = (relation.get("email") or "").strip()
+        if not email:
+            continue
+        info = index.setdefault(email, {"channelIds": [], "lastSeenAt": None})
+        channel_id = relation.get("channel_id")
+        if channel_id and channel_id not in info["channelIds"]:
+            info["channelIds"].append(channel_id)
+        last_seen = relation.get("last_seen_at")
+        if last_seen and (info.get("lastSeenAt") is None or last_seen > info["lastSeenAt"]):
+            info["lastSeenAt"] = last_seen
+
+    for entry in emails_unique:
+        email = (entry.get("email") or "").strip()
+        if not email:
+            continue
+        info = index.setdefault(email, {"channelIds": [], "lastSeenAt": None})
+        first_seen_channel = entry.get("first_seen_channel_id")
+        if first_seen_channel:
+            info["firstSeenChannelId"] = first_seen_channel
+        last_seen = entry.get("last_seen_at")
+        if last_seen and (info.get("lastSeenAt") is None or last_seen > info["lastSeenAt"]):
+            info["lastSeenAt"] = last_seen
+
+    for email, info in index.items():
+        channel_ids = sorted(dict.fromkeys(info.get("channelIds", [])))
+        info["channelIds"] = channel_ids
+        info.setdefault("firstSeenChannelId", None)
+        info.setdefault("lastSeenAt", None)
+        info["channelCount"] = len(channel_ids)
+
+    return dict(sorted(index.items(), key=lambda item: item[0]))
 
 
 def restore_channels_by_ids(
