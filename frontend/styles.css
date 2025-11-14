@@ -138,6 +138,23 @@ a:hover {
   font-size: 18px;
 }
 
+.btn--xl {
+  padding: 14px 28px;
+  font-size: 18px;
+}
+
+.btn--ghost {
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  padding: 8px 14px;
+}
+
+.btn--ghost:not(:disabled):hover {
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: none;
+}
+
 .discover-panel {
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
@@ -148,34 +165,26 @@ a:hover {
   gap: 16px;
 }
 
-.discover-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 160px;
-  gap: 16px;
-  align-items: stretch;
-}
-
-.discover-field {
+.discover-controls {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
 }
 
-.discover-field textarea,
-.discover-field input {
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  padding: 10px 12px;
-  background: var(--bg-elevated-strong);
-  resize: vertical;
+.discover-primary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
 }
 
-.discover-field--small input {
-  width: 100%;
+.discover-summary {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-muted);
 }
 
-.discover-actions {
-  grid-column: 1 / -1;
+.discover-utilities {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
@@ -558,6 +567,10 @@ a:hover {
   flex-direction: column;
 }
 
+.modal-content--wide {
+  width: min(640px, 100%);
+}
+
 .modal-header {
   display: flex;
   justify-content: space-between;
@@ -580,17 +593,84 @@ a:hover {
   gap: 16px;
 }
 
+.discover-modal-body {
+  gap: 24px;
+}
+
+.modal-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal-section__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.modal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
 .modal-field {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.modal-field input[type='file'] {
+.modal-field input,
+.modal-field textarea,
+.modal-field select {
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
   padding: 10px 12px;
   background: var(--bg-elevated-strong);
+  color: inherit;
+}
+
+.modal-field textarea {
+  min-height: 140px;
+  resize: vertical;
+}
+
+.modal-field--full {
+  grid-column: 1 / -1;
+}
+
+.modal-field--inline select,
+.modal-field--inline .modal-hint {
+  margin-left: 28px;
+}
+
+.modal-switches {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.modal-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.modal-toggle input {
+  margin: 0;
+}
+
+.modal-field input[type='file'] {
+  cursor: pointer;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 0 24px 24px;
 }
 
 .modal-hint {

@@ -132,6 +132,45 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+const DISCOVERY_SETTINGS_STORAGE_KEY = 'dashboard:discoverySettings';
+const DEFAULT_DISCOVERY_KEYWORDS =
+  'crypto, bitcoin, ethereum, defi, altcoin, memecoin, onchain, crypto trading';
+
+function parseDiscoveryKeywords(text) {
+  if (!text) {
+    return [];
+  }
+  return text
+    .split(/[\n,]+/)
+    .map((word) => word.trim())
+    .filter(Boolean);
+}
+
+function parseDiscoveryDenyLanguages(text) {
+  if (!text) {
+    return [];
+  }
+  return text
+    .split(/[\s,]+/)
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function defaultDiscoverySettingsState() {
+  return {
+    keywordsText: DEFAULT_DISCOVERY_KEYWORDS,
+    keywords: parseDiscoveryKeywords(DEFAULT_DISCOVERY_KEYWORDS),
+    perKeyword: 5,
+    lastUploadMaxAgeDays: null,
+    denyLanguagesText: '',
+    denyLanguages: [],
+    autoEnrichEnabled: false,
+    autoEnrichMode: 'email_only',
+    enrichLimit: null,
+    runUntilStopped: false,
+  };
+}
+
 class Dashboard {
   constructor(root) {
     this.root = root;
@@ -151,16 +190,19 @@ class Dashboard {
     this.discoveryLoopStats = { runs: 0, found: 0 };
     this.pendingAutoEnrich = 0;
     this.autoEnrichQueuedNotified = false;
+    this.discoverySettings = defaultDiscoverySettingsState();
   }
 
   init() {
     this.cacheElements();
+    this.loadDiscoverySettings();
     this.bindEvents();
     this.renderTabs();
     this.applyFiltersToUI(this.tables[this.activeTab].filters);
     this.updateSortInputs();
     this.updatePagination();
     this.renderTable(true);
+    this.updateDiscoverySummary();
     this.updateQuickStats();
     this.updateStatusBar('', 'info');
     this.loadStats();
@@ -187,18 +229,26 @@ class Dashboard {
       statusBar: this.root.querySelector('#statusBar'),
       progressBar: this.root.querySelector('#progressBar'),
       summaryBar: this.root.querySelector('#summaryBar'),
-      discoverKeywords: this.root.querySelector('#discoverKeywords'),
-      discoverPerKeyword: this.root.querySelector('#discoverPerKeyword'),
-      discoverDenyLanguages: this.root.querySelector('#discoverDenyLanguages'),
-      discoverLastUploadMaxAge: this.root.querySelector('#discoverLastUploadMaxAge'),
+      discoverKeywords: document.getElementById('discoverKeywords'),
+      discoverPerKeyword: document.getElementById('discoverPerKeyword'),
+      discoverDenyLanguages: document.getElementById('discoverDenyLanguages'),
+      discoverLastUploadMaxAge: document.getElementById('discoverLastUploadMaxAge'),
       discoverBtn: this.root.querySelector('#discoverBtn'),
-      discoverRunBtn: this.root.querySelector('#discoverRunBtn'),
+      discoverSettingsBtn: this.root.querySelector('#discoverSettingsBtn'),
+      discoverSummary: this.root.querySelector('#discoverSummary'),
       discoverStopBtn: this.root.querySelector('#discoverStopBtn'),
       discoverRunCounter: this.root.querySelector('#discoverRunCounter'),
-      discoverAutoEnrichToggle: this.root.querySelector('#discoverAutoEnrichToggle'),
+      discoverAutoEnrichToggle: document.getElementById('discoverAutoEnrichToggle'),
+      discoverAutoEnrichMode: document.getElementById('discoverAutoEnrichMode'),
+      discoverRunUntilStopped: document.getElementById('discoverRunUntilStopped'),
+      discoverSettingsModal: document.getElementById('discoverSettingsModal'),
+      discoverSettingsClose: document.getElementById('discoverSettingsCloseBtn'),
+      discoverSettingsCancel: document.getElementById('discoverSettingsCancelBtn'),
+      discoverSettingsForm: document.getElementById('discoverSettingsForm'),
+      discoverSettingsStart: document.getElementById('discoverSettingsStartBtn'),
       enrichBtn: this.root.querySelector('#enrichBtn'),
       enrichEmailBtn: this.root.querySelector('#enrichEmailBtn'),
-      enrichLimit: this.root.querySelector('#enrichLimit'),
+      enrichLimit: document.getElementById('enrichLimit'),
       enrichForceToggle: this.root.querySelector('#enrichForceToggle'),
       enrichNeverToggle: this.root.querySelector('#enrichNeverToggle'),
       importBlacklistBtn: this.root.querySelector('#importBlacklistBtn'),
@@ -286,21 +336,28 @@ class Dashboard {
     this.el.exportCsvBtn.addEventListener('click', () => this.handleExportCsv());
     this.el.exportBundleBtn?.addEventListener('click', () => this.handleExportBundle());
 
-    this.el.discoverBtn.addEventListener('click', () => this.handleDiscover());
-    this.el.discoverRunBtn?.addEventListener('click', () => this.startDiscoveryLoop());
+    this.el.discoverBtn.addEventListener('click', () => this.openDiscoverSettings());
+    this.el.discoverSettingsBtn?.addEventListener('click', () => this.openDiscoverSettings());
     this.el.discoverStopBtn?.addEventListener('click', () => this.stopDiscoveryLoop());
     this.el.enrichBtn.addEventListener('click', () => this.handleEnrich('full'));
     this.el.enrichEmailBtn.addEventListener('click', () => this.handleEnrich('email_only'));
 
-    this.el.discoverAutoEnrichToggle?.addEventListener('change', (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLInputElement)) {
-        return;
+    this.el.discoverAutoEnrichToggle?.addEventListener('change', () => {
+      if (this.el.discoverAutoEnrichMode) {
+        this.el.discoverAutoEnrichMode.disabled = !this.el.discoverAutoEnrichToggle.checked;
       }
-      if (!target.checked) {
-        this.pendingAutoEnrich = 0;
-        this.autoEnrichQueuedNotified = false;
+    });
+
+    this.el.discoverSettingsClose?.addEventListener('click', () => this.closeDiscoverSettings());
+    this.el.discoverSettingsCancel?.addEventListener('click', () => this.closeDiscoverSettings());
+    this.el.discoverSettingsModal?.addEventListener('click', (event) => {
+      if (event.target === this.el.discoverSettingsModal) {
+        this.closeDiscoverSettings();
       }
+    });
+    this.el.discoverSettingsForm?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      await this.handleDiscoverSettingsSubmit();
     });
 
     this.el.importBlacklistBtn.addEventListener('click', () => this.openModal());
@@ -316,6 +373,307 @@ class Dashboard {
       event.preventDefault();
       this.handleBlacklistImport();
     });
+  }
+
+  loadDiscoverySettings() {
+    const defaults = defaultDiscoverySettingsState();
+    let settings = defaults;
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const stored = window.localStorage.getItem(DISCOVERY_SETTINGS_STORAGE_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          settings = this.normalizeDiscoverySettings({ ...defaults, ...parsed });
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to load discovery settings', error);
+      settings = defaults;
+    }
+    this.discoverySettings = settings;
+  }
+
+  saveDiscoverySettings() {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return;
+    }
+    try {
+      window.localStorage.setItem(
+        DISCOVERY_SETTINGS_STORAGE_KEY,
+        JSON.stringify(this.discoverySettings),
+      );
+    } catch (error) {
+      console.warn('Failed to save discovery settings', error);
+    }
+  }
+
+  normalizeDiscoverySettings(raw) {
+    const defaults = defaultDiscoverySettingsState();
+    const keywordsText =
+      typeof raw.keywordsText === 'string'
+        ? raw.keywordsText
+        : Array.isArray(raw.keywords)
+        ? raw.keywords.join(', ')
+        : defaults.keywordsText;
+    const keywords = parseDiscoveryKeywords(keywordsText);
+    const perKeywordRaw = Number(raw.perKeyword);
+    const perKeyword =
+      Number.isNaN(perKeywordRaw) || perKeywordRaw <= 0
+        ? defaults.perKeyword
+        : Math.max(1, Math.floor(perKeywordRaw));
+
+    let lastUploadMaxAgeDays = null;
+    const lastRaw = raw.lastUploadMaxAgeDays;
+    if (typeof lastRaw === 'number') {
+      if (lastRaw > 0) {
+        lastUploadMaxAgeDays = Math.floor(lastRaw);
+      }
+    } else if (typeof lastRaw === 'string' && lastRaw.trim() !== '') {
+      const parsed = Number(lastRaw);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        lastUploadMaxAgeDays = Math.floor(parsed);
+      }
+    }
+
+    const denyLanguagesText =
+      typeof raw.denyLanguagesText === 'string'
+        ? raw.denyLanguagesText
+        : Array.isArray(raw.denyLanguages)
+        ? raw.denyLanguages.join(', ')
+        : '';
+    const denyLanguages = parseDiscoveryDenyLanguages(denyLanguagesText);
+
+    let enrichLimit = null;
+    const enrichRaw = raw.enrichLimit;
+    if (typeof enrichRaw === 'number') {
+      if (enrichRaw > 0) {
+        enrichLimit = Math.floor(enrichRaw);
+      }
+    } else if (typeof enrichRaw === 'string' && enrichRaw.trim() !== '') {
+      const parsed = Number(enrichRaw);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        enrichLimit = Math.floor(parsed);
+      }
+    }
+
+    const autoEnrichMode = raw.autoEnrichMode === 'full' ? 'full' : 'email_only';
+    const autoEnrichEnabled = Boolean(raw.autoEnrichEnabled);
+    const runUntilStopped = Boolean(raw.runUntilStopped);
+
+    return {
+      keywordsText,
+      keywords,
+      perKeyword,
+      lastUploadMaxAgeDays,
+      denyLanguagesText,
+      denyLanguages,
+      enrichLimit,
+      autoEnrichEnabled,
+      autoEnrichMode,
+      runUntilStopped,
+    };
+  }
+
+  setDiscoverySettings(settings) {
+    const normalized = this.normalizeDiscoverySettings({
+      ...this.discoverySettings,
+      ...settings,
+    });
+    this.discoverySettings = normalized;
+    if (!normalized.autoEnrichEnabled) {
+      this.pendingAutoEnrich = 0;
+      this.autoEnrichQueuedNotified = false;
+    }
+    this.saveDiscoverySettings();
+    this.updateDiscoverySummary();
+  }
+
+  updateDiscoverySummary() {
+    if (!this.el.discoverSummary) {
+      return;
+    }
+    const settings = this.discoverySettings || defaultDiscoverySettingsState();
+    const parts = [];
+    if (settings.keywords?.length) {
+      const preview = settings.keywords.slice(0, 3).join(', ');
+      const hasMore = settings.keywords.length > 3;
+      parts.push(`Keywords: ${preview}${hasMore ? '…' : ''}`);
+    } else {
+      parts.push('Keywords: not set');
+    }
+    parts.push(`Per keyword: ${formatNumber(settings.perKeyword || 5)}`);
+    if (settings.lastUploadMaxAgeDays != null) {
+      parts.push(`Max age: ${formatNumber(settings.lastUploadMaxAgeDays)} days`);
+    }
+    if (settings.denyLanguages?.length) {
+      parts.push(`Deny languages: ${settings.denyLanguages.join(', ')}`);
+    }
+    if (settings.enrichLimit != null) {
+      parts.push(`Enrich limit: ${formatNumber(settings.enrichLimit)}`);
+    }
+    if (settings.autoEnrichEnabled) {
+      const modeLabel = settings.autoEnrichMode === 'full' ? 'normal' : 'email only';
+      parts.push(`Auto enrich: ${modeLabel}`);
+    } else {
+      parts.push('Auto enrich: off');
+    }
+    if (settings.runUntilStopped) {
+      parts.push('Loop: on');
+    }
+    this.el.discoverSummary.textContent = parts.join(' · ');
+  }
+
+  openDiscoverSettings() {
+    if (!this.el.discoverSettingsModal) {
+      return;
+    }
+    if (this.discoveryLoopActive) {
+      this.updateStatusBar(
+        'Discovery loop is running. Stop it before changing settings.',
+        'info',
+      );
+      return;
+    }
+    this.populateDiscoverSettingsForm();
+    this.el.discoverSettingsModal.removeAttribute('hidden');
+  }
+
+  closeDiscoverSettings() {
+    this.el.discoverSettingsModal?.setAttribute('hidden', 'true');
+  }
+
+  populateDiscoverSettingsForm() {
+    const settings = this.discoverySettings || defaultDiscoverySettingsState();
+    if (this.el.discoverKeywords) {
+      this.el.discoverKeywords.value = settings.keywordsText || '';
+    }
+    if (this.el.discoverPerKeyword) {
+      this.el.discoverPerKeyword.value = String(settings.perKeyword ?? 5);
+    }
+    if (this.el.discoverLastUploadMaxAge) {
+      this.el.discoverLastUploadMaxAge.value =
+        settings.lastUploadMaxAgeDays != null ? String(settings.lastUploadMaxAgeDays) : '';
+    }
+    if (this.el.discoverDenyLanguages) {
+      this.el.discoverDenyLanguages.value = settings.denyLanguagesText || '';
+    }
+    if (this.el.discoverRunUntilStopped) {
+      this.el.discoverRunUntilStopped.checked = Boolean(settings.runUntilStopped);
+    }
+    if (this.el.discoverAutoEnrichToggle) {
+      this.el.discoverAutoEnrichToggle.checked = Boolean(settings.autoEnrichEnabled);
+    }
+    if (this.el.discoverAutoEnrichMode) {
+      this.el.discoverAutoEnrichMode.value =
+        settings.autoEnrichMode === 'full' ? 'full' : 'email_only';
+      this.el.discoverAutoEnrichMode.disabled = !settings.autoEnrichEnabled;
+    }
+    if (this.el.enrichLimit) {
+      this.el.enrichLimit.value =
+        settings.enrichLimit != null ? String(settings.enrichLimit) : '';
+    }
+  }
+
+  collectDiscoverySettingsFromDialog() {
+    if (!this.el.discoverKeywords || !this.el.discoverPerKeyword) {
+      return null;
+    }
+    const keywordsText = this.el.discoverKeywords.value;
+    const keywords = parseDiscoveryKeywords(keywordsText);
+    if (!keywords.length) {
+      this.updateStatusBar('Please provide at least one keyword.', 'error');
+      return null;
+    }
+
+    const perKeywordRaw = Number(this.el.discoverPerKeyword.value);
+    const perKeyword =
+      Number.isNaN(perKeywordRaw) || perKeywordRaw <= 0
+        ? this.discoverySettings?.perKeyword || 5
+        : Math.max(1, Math.floor(perKeywordRaw));
+
+    const denyLanguagesText = this.el.discoverDenyLanguages?.value ?? '';
+    const denyLanguages = parseDiscoveryDenyLanguages(denyLanguagesText);
+
+    const maxAgeRaw = this.el.discoverLastUploadMaxAge?.value ?? '';
+    let lastUploadMaxAgeDays = null;
+    if (typeof maxAgeRaw === 'string' && maxAgeRaw.trim() !== '') {
+      const parsed = Number(maxAgeRaw);
+      if (Number.isNaN(parsed) || parsed < 0) {
+        this.updateStatusBar('Last upload max age must be zero or greater.', 'error');
+        return null;
+      }
+      lastUploadMaxAgeDays = parsed > 0 ? Math.floor(parsed) : null;
+    }
+
+    const enrichLimitRaw = this.el.enrichLimit?.value ?? '';
+    let enrichLimit = null;
+    if (typeof enrichLimitRaw === 'string' && enrichLimitRaw.trim() !== '') {
+      const parsed = Number(enrichLimitRaw);
+      if (Number.isNaN(parsed) || parsed <= 0) {
+        this.updateStatusBar('Enrichment limit must be a positive number.', 'error');
+        return null;
+      }
+      enrichLimit = Math.floor(parsed);
+    }
+
+    const autoEnrichEnabled = Boolean(this.el.discoverAutoEnrichToggle?.checked);
+    const autoEnrichMode =
+      this.el.discoverAutoEnrichMode?.value === 'full' ? 'full' : 'email_only';
+    const runUntilStopped = Boolean(this.el.discoverRunUntilStopped?.checked);
+
+    return {
+      keywordsText,
+      keywords,
+      perKeyword,
+      denyLanguagesText,
+      denyLanguages,
+      lastUploadMaxAgeDays,
+      enrichLimit,
+      autoEnrichEnabled,
+      autoEnrichMode,
+      runUntilStopped,
+    };
+  }
+
+  collectDiscoveryInputsFromSettings() {
+    const settings = this.discoverySettings;
+    if (!settings || !settings.keywords || !settings.keywords.length) {
+      this.updateStatusBar('Please provide at least one keyword.', 'error');
+      return null;
+    }
+    return {
+      keywords: [...settings.keywords],
+      perKeyword: Math.max(1, Math.floor(Number(settings.perKeyword) || 1)),
+      denyLanguages: Array.isArray(settings.denyLanguages)
+        ? [...settings.denyLanguages]
+        : [],
+      lastUploadMaxAgeDays: settings.lastUploadMaxAgeDays,
+    };
+  }
+
+  async handleDiscoverSettingsSubmit() {
+    if (this.discoveryLoopActive) {
+      this.updateStatusBar(
+        'Discovery loop is running. Stop it before starting a manual discovery.',
+        'info',
+      );
+      return;
+    }
+    const settings = this.collectDiscoverySettingsFromDialog();
+    if (!settings) {
+      return;
+    }
+    this.setDiscoverySettings(settings);
+    this.closeDiscoverSettings();
+    const inputs = this.collectDiscoveryInputsFromSettings();
+    if (!inputs) {
+      return;
+    }
+    if (settings.runUntilStopped) {
+      await this.startDiscoveryLoop(inputs);
+    } else {
+      await this.performDiscoveryRun(inputs);
+    }
   }
 
   renderTabs() {
@@ -906,54 +1264,6 @@ class Dashboard {
     }
   }
 
-  parseKeywordsInput() {
-    return this.el.discoverKeywords.value
-      .split(/[\n,]+/)
-      .map((word) => word.trim())
-      .filter(Boolean);
-  }
-
-  parseDenyLanguagesInput() {
-    if (!this.el.discoverDenyLanguages) {
-      return [];
-    }
-    return this.el.discoverDenyLanguages.value
-      .split(/[\s,]+/)
-      .map((value) => value.trim().toLowerCase())
-      .filter(Boolean);
-  }
-
-  collectDiscoveryInputs() {
-    const keywords = this.parseKeywordsInput();
-    if (!keywords.length) {
-      this.updateStatusBar('Please provide at least one keyword.', 'error');
-      return null;
-    }
-
-    const perKeywordRaw = Number(this.el.discoverPerKeyword.value);
-    const perKeyword =
-      Number.isNaN(perKeywordRaw) || perKeywordRaw <= 0 ? 5 : Math.max(1, Math.floor(perKeywordRaw));
-
-    const denyLanguages = this.parseDenyLanguagesInput();
-    const maxAgeRaw = this.el.discoverLastUploadMaxAge?.value ?? '';
-    let lastUploadMaxAge = null;
-    if (typeof maxAgeRaw === 'string' && maxAgeRaw.trim() !== '') {
-      const parsed = Number(maxAgeRaw);
-      if (Number.isNaN(parsed) || parsed < 0) {
-        this.updateStatusBar('Last upload max age must be zero or greater.', 'error');
-        return null;
-      }
-      lastUploadMaxAge = Math.floor(parsed);
-    }
-
-    return {
-      keywords,
-      perKeyword,
-      denyLanguages,
-      lastUploadMaxAgeDays: lastUploadMaxAge,
-    };
-  }
-
   async performDiscoveryRun(inputs, options = {}) {
     const { statusLabel, deferStatusUpdate = false } = options;
     const prefix = statusLabel ? `${statusLabel}: ` : '';
@@ -987,21 +1297,6 @@ class Dashboard {
     }
   }
 
-  async handleDiscover() {
-    if (this.discoveryLoopActive) {
-      this.updateStatusBar(
-        'Discovery loop is running. Stop it before starting a manual discovery.',
-        'info',
-      );
-      return;
-    }
-    const inputs = this.collectDiscoveryInputs();
-    if (!inputs) {
-      return;
-    }
-    await this.performDiscoveryRun(inputs);
-  }
-
   async handleEnrich(mode, overrides = {}) {
     if (this.enrichmentBusy) {
       return;
@@ -1010,8 +1305,8 @@ class Dashboard {
     let limitValue = null;
     if (limitOverride != null) {
       limitValue = Number(limitOverride);
-    } else if (this.el.enrichLimit.value) {
-      limitValue = Number(this.el.enrichLimit.value);
+    } else if (this.discoverySettings?.enrichLimit != null) {
+      limitValue = Number(this.discoverySettings.enrichLimit);
     }
     if (limitValue != null && (Number.isNaN(limitValue) || limitValue <= 0)) {
       this.updateStatusBar('Enrichment limit must be a positive number.', 'error');
@@ -1061,7 +1356,7 @@ class Dashboard {
   }
 
   isAutoEnrichEnabled() {
-    return Boolean(this.el.discoverAutoEnrichToggle?.checked);
+    return Boolean(this.discoverySettings?.autoEnrichEnabled);
   }
 
   async triggerAutoEnrich(newChannelsCount) {
@@ -1081,7 +1376,8 @@ class Dashboard {
       }
       return;
     }
-    await this.handleEnrich('email_only', { limitOverride: count, autoTriggered: true });
+    const mode = this.discoverySettings?.autoEnrichMode === 'full' ? 'full' : 'email_only';
+    await this.handleEnrich(mode, { limitOverride: count, autoTriggered: true });
   }
 
   async processPendingAutoEnrich() {
@@ -1099,12 +1395,12 @@ class Dashboard {
     await this.triggerAutoEnrich(queued);
   }
 
-  async startDiscoveryLoop() {
+  async startDiscoveryLoop(initialInputs = null) {
     if (this.discoveryLoopActive) {
       this.updateStatusBar('Discovery loop is already running.', 'info');
       return;
     }
-    const inputs = this.collectDiscoveryInputs();
+    const inputs = initialInputs ?? this.collectDiscoveryInputsFromSettings();
     if (!inputs) {
       return;
     }
@@ -1177,11 +1473,11 @@ class Dashboard {
 
   setDiscoveryLoopRunningState(running) {
     this.discoveryLoopActive = running;
-    if (this.el.discoverRunBtn) {
-      this.el.discoverRunBtn.disabled = running;
-    }
     if (this.el.discoverBtn) {
       this.el.discoverBtn.disabled = running;
+    }
+    if (this.el.discoverSettingsBtn) {
+      this.el.discoverSettingsBtn.disabled = running;
     }
     if (this.el.discoverStopBtn) {
       if (running) {
