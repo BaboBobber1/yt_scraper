@@ -130,9 +130,13 @@ export async function fetchStats() {
   return request('/api/stats');
 }
 
-export async function downloadCsv(category, filters, sort, order) {
+export async function downloadCsv(category, filters, sort, order, options = {}) {
   const query = buildQuery(filters, category, sort, order, 10000, 0);
-  const response = await fetch(`/api/export/csv?${query}`, {
+  const params = new URLSearchParams(query);
+  if (options.archiveExported) {
+    params.set('archive_exported', 'true');
+  }
+  const response = await fetch(`/api/export/csv?${params.toString()}`, {
     headers: {
       ...JSON_HEADERS,
     },

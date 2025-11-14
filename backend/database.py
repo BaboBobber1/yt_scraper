@@ -71,6 +71,8 @@ CHANNEL_COLUMNS = [
     "status",
     "status_reason",
     "last_status_change",
+    "archived_at",
+    "exported_at",
 ]
 
 LEGACY_TABLE = "channels"
@@ -107,13 +109,21 @@ def init_db() -> None:
                     last_error TEXT,
                     status TEXT NOT NULL DEFAULT 'new',
                     status_reason TEXT,
-                    last_status_change TEXT
+                    last_status_change TEXT,
+                    archived_at TEXT,
+                    exported_at TEXT
                 )
                 """
             )
             _ensure_column(cursor, table, "email_gate_present", "INTEGER")
             _ensure_column(cursor, table, "last_enriched_at", "TEXT")
             _ensure_column(cursor, table, "last_enriched_result", "TEXT")
+            _ensure_column(cursor, table, "archived_at", "TEXT")
+            _ensure_column(cursor, table, "exported_at", "TEXT")
+            cursor.execute(
+                f"UPDATE {table} SET archived_at = last_status_change "
+                "WHERE archived_at IS NULL AND status = 'archived' AND last_status_change IS NOT NULL"
+            )
 
         cursor.execute(
             """
@@ -357,6 +367,11 @@ def _insert_or_replace(cursor: sqlite3.Cursor, table: str, payload: Dict[str, An
         f"ON CONFLICT(channel_id) DO UPDATE SET {updates}",
         values,
     )
+
+
+def _chunked(sequence: Sequence[str], size: int) -> Iterable[Sequence[str]]:
+    for start in range(0, len(sequence), size):
+        yield sequence[start : start + size]
 
 
 def insert_channel(channel: Dict[str, Any], *, category: ChannelCategory = ChannelCategory.ACTIVE) -> bool:
@@ -687,6 +702,8 @@ def get_channels(
         "created_at": "created_at",
         "status": "status",
         "last_status_change": "last_status_change",
+        "exported_at": "exported_at",
+        "archived_at": "archived_at",
     }
     sort_column = valid_sorts.get(sort, "created_at")
     order_direction = "DESC" if order.lower() == "desc" else "ASC"
@@ -771,6 +788,10 @@ def _move_channels(
             data["status_reason"] = status_reason
             data["last_status_change"] = timestamp
             data["needs_enrichment"] = needs_enrichment
+            if destination is ChannelCategory.ARCHIVED:
+                data["archived_at"] = timestamp
+            else:
+                data["archived_at"] = None
             _insert_or_replace(cursor, CHANNEL_TABLES[destination], data)
             moved.append(data["channel_id"])
         _delete_channels_by_ids(cursor, source, moved)
@@ -787,6 +808,35 @@ def archive_channels_by_ids(channel_ids: Sequence[str], timestamp: str) -> List[
         status_reason="Archived",
         needs_enrichment=0,
     )
+
+
+def mark_channels_exported(
+    category: ChannelCategory,
+    channel_ids: Sequence[str],
+    timestamp: str,
+    *,
+    archive: bool = False,
+) -> List[str]:
+    if not channel_ids:
+        return []
+
+    unique_ids = list(dict.fromkeys(cid for cid in channel_ids if cid))
+    if not unique_ids:
+        return []
+
+    table = CHANNEL_TABLES[category]
+    with get_cursor() as cursor:
+        for chunk in _chunked(unique_ids, 200):
+            placeholders = ",".join("?" for _ in chunk)
+            cursor.execute(
+                f"UPDATE {table} SET exported_at = ? WHERE channel_id IN ({placeholders})",
+                [timestamp, *chunk],
+            )
+
+    archived: List[str] = []
+    if archive and category is ChannelCategory.ACTIVE:
+        archived = archive_channels_by_ids(unique_ids, timestamp)
+    return archived
 
 
 def restore_channels_by_ids(

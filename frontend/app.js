@@ -106,7 +106,7 @@ function formatDate(value) {
   if (Number.isNaN(date.getTime())) {
     return value;
   }
-  return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
+  return date.toLocaleDateString();
 }
 
 function parseList(value) {
@@ -183,6 +183,7 @@ class Dashboard {
   init() {
     this.cacheElements();
     this.bindEvents();
+    this.updateExportArchiveToggle();
     this.renderTabs();
     this.applyFiltersToUI(this.tables[this.activeTab].filters);
     this.updateSortInputs();
@@ -203,6 +204,7 @@ class Dashboard {
       bulkPrimaryBtn: this.root.querySelector('#bulkPrimaryBtn'),
       bulkSecondaryBtn: this.root.querySelector('#bulkSecondaryBtn'),
       exportCsvBtn: this.root.querySelector('#exportCsvBtn'),
+      exportArchiveToggle: this.root.querySelector('#exportArchiveToggle'),
       sortSelect: this.root.querySelector('#sortSelect'),
       orderSelect: this.root.querySelector('#orderSelect'),
       tableBody: this.root.querySelector('#tableBody'),
@@ -238,6 +240,17 @@ class Dashboard {
       filterEmailGateOnly: this.root.querySelector('#filterEmailGateOnly'),
       filterStatusCheckboxes: Array.from(this.root.querySelectorAll('input[name="statusFilter"]')),
     };
+  }
+
+  updateExportArchiveToggle(category = this.activeTab) {
+    if (!this.el.exportArchiveToggle) {
+      return;
+    }
+    const isActive = category === Category.ACTIVE;
+    this.el.exportArchiveToggle.disabled = !isActive;
+    if (!isActive) {
+      this.el.exportArchiveToggle.checked = false;
+    }
   }
 
   bindEvents() {
@@ -548,7 +561,7 @@ class Dashboard {
     });
 
     if (loadingState) {
-      this.el.tableBody.innerHTML = '<tr><td colspan="7" class="table-loading">Loading channels…</td></tr>';
+      this.el.tableBody.innerHTML = '<tr><td colspan="9" class="table-loading">Loading channels…</td></tr>';
       return;
     }
 
@@ -556,12 +569,12 @@ class Dashboard {
       if (this.el.tableStatus) {
         this.el.tableStatus.textContent = 'Failed to load channels';
       }
-      this.el.tableBody.innerHTML = `<tr><td colspan="7" class="table-error">${table.error}</td></tr>`;
+      this.el.tableBody.innerHTML = `<tr><td colspan="9" class="table-error">${table.error}</td></tr>`;
       return;
     }
 
     if (!table.rows.length) {
-      this.el.tableBody.innerHTML = '<tr><td colspan="7" class="table-empty">No channels match the current filters.</td></tr>';
+    this.el.tableBody.innerHTML = '<tr><td colspan="9" class="table-empty">No channels match the current filters.</td></tr>';
       return;
     }
 
@@ -627,6 +640,8 @@ class Dashboard {
           ${reason ? `<span class="status-reason">${reason}</span>` : ''}
         </td>
         <td>${formatDate(row.last_updated || row.created_at)}</td>
+        <td>${formatDate(row.exported_at)}</td>
+        <td>${formatDate(row.archived_at)}</td>
         <td class="actions-cell">${actionButtons}</td>
       </tr>
     `;
@@ -664,6 +679,7 @@ class Dashboard {
 
   changeTab(category) {
     this.activeTab = category;
+    this.updateExportArchiveToggle(category);
     this.renderTabs();
     this.applyFiltersToUI(this.tables[category].filters);
     this.updateSortInputs();
@@ -814,11 +830,14 @@ class Dashboard {
 
   async handleExportCsv() {
     try {
+      const archiveAfterExport = Boolean(this.el.exportArchiveToggle && this.el.exportArchiveToggle.checked);
+      const shouldArchive = this.activeTab === Category.ACTIVE && archiveAfterExport;
       const csv = await downloadCsv(
         this.activeTab,
         this.tables[this.activeTab].filters,
         this.tables[this.activeTab].sort,
         this.tables[this.activeTab].order,
+        { archiveExported: shouldArchive },
       );
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -830,7 +849,12 @@ class Dashboard {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      this.updateStatusBar('CSV exported successfully.', 'success');
+      if (shouldArchive) {
+        await this.afterMove(Category.ACTIVE, Category.ARCHIVED);
+        this.updateStatusBar('CSV exported and archived.', 'success');
+      } else {
+        this.updateStatusBar('CSV exported successfully.', 'success');
+      }
     } catch (error) {
       console.error('CSV export failed', error);
       this.updateStatusBar(error instanceof Error ? error.message : 'CSV export failed.', 'error');
