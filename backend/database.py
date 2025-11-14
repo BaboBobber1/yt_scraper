@@ -64,6 +64,8 @@ CHANNEL_COLUMNS = [
     "last_updated",
     "created_at",
     "last_attempted",
+    "last_enriched_at",
+    "last_enriched_result",
     "needs_enrichment",
     "last_error",
     "status",
@@ -99,6 +101,8 @@ def init_db() -> None:
                     last_updated TEXT,
                     created_at TEXT NOT NULL,
                     last_attempted TEXT,
+                    last_enriched_at TEXT,
+                    last_enriched_result TEXT,
                     needs_enrichment INTEGER NOT NULL DEFAULT 1,
                     last_error TEXT,
                     status TEXT NOT NULL DEFAULT 'new',
@@ -108,6 +112,8 @@ def init_db() -> None:
                 """
             )
             _ensure_column(cursor, table, "email_gate_present", "INTEGER")
+            _ensure_column(cursor, table, "last_enriched_at", "TEXT")
+            _ensure_column(cursor, table, "last_enriched_result", "TEXT")
 
         cursor.execute(
             """
@@ -189,6 +195,8 @@ def _migrate_legacy_channels(cursor: sqlite3.Cursor) -> None:
             "last_updated": record.get("last_updated"),
             "created_at": record.get("created_at") or record.get("last_updated"),
             "last_attempted": record.get("last_attempted"),
+            "last_enriched_at": record.get("last_enriched_at"),
+            "last_enriched_result": record.get("last_enriched_result"),
             "needs_enrichment": record.get("needs_enrichment", 1),
             "last_error": record.get("last_error"),
             "status": record.get("status", "new"),
@@ -536,6 +544,8 @@ def update_channel_enrichment(
     email_gate_present: Optional[bool] = None,
     last_updated: Optional[str] = None,
     last_attempted: Optional[str] = None,
+    last_enriched_at: Optional[str] = None,
+    last_enriched_result: Optional[str] = None,
     needs_enrichment: Optional[bool] = None,
     last_error: Optional[str] = None,
     status: Optional[str] = None,
@@ -559,6 +569,10 @@ def update_channel_enrichment(
         updates["last_updated"] = last_updated
     if last_attempted is not None:
         updates["last_attempted"] = last_attempted
+    if last_enriched_at is not None:
+        updates["last_enriched_at"] = last_enriched_at
+    if last_enriched_result is not None:
+        updates["last_enriched_result"] = last_enriched_result
     if needs_enrichment is not None:
         updates["needs_enrichment"] = int(bool(needs_enrichment))
     if last_error is not None:

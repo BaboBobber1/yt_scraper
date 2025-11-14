@@ -181,6 +181,25 @@ a:hover {
   gap: 12px;
 }
 
+.discover-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.discover-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.discover-toggle input {
+  margin: 0;
+}
+
 .status-container {
   display: flex;
   flex-direction: column;

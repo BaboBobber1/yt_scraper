@@ -9,10 +9,22 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import database
 from .youtube import EnrichmentError, enrich_channel, enrich_channel_email_only
+
+
+NO_EMAIL_RETRY_WINDOW = dt.timedelta(days=30)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -25,6 +37,8 @@ class EnrichmentJob:
     started_at: float = field(default_factory=time.monotonic)
     completed: int = 0
     errors: int = 0
+    requested: int = 0
+    skipped: int = 0
     queue: "queue.Queue[Optional[Dict]]" = field(default_factory=queue.Queue)
     lock: threading.Lock = field(default_factory=threading.Lock)
     done_event: threading.Event = field(default_factory=threading.Event)
@@ -62,6 +76,8 @@ class EnrichmentJob:
             "pending": pending,
             "durationSeconds": round(elapsed, 2),
             "mode": self.mode,
+            "requested": self.requested,
+            "skipped": self.skipped,
         }
 
 
@@ -73,28 +89,71 @@ class EnrichmentManager:
         self._jobs: Dict[str, EnrichmentJob] = {}
         self._lock = threading.Lock()
 
-    def start_job(self, limit: Optional[int], mode: str = "full") -> EnrichmentJob:
+    def start_job(
+        self,
+        limit: Optional[int],
+        mode: str = "full",
+        *,
+        force_run: bool = False,
+        never_reenrich: bool = False,
+    ) -> EnrichmentJob:
         if mode not in {"full", "email_only"}:
             raise ValueError(f"Unsupported enrichment mode: {mode}")
         if mode == "email_only":
             channels = database.get_channels_for_email_enrichment(limit)
         else:
             channels = database.get_pending_channels(limit)
+        filtered, skipped = self._filter_channels(channels, force_run=force_run, never_reenrich=never_reenrich)
         job_id = str(uuid.uuid4())
-        job = EnrichmentJob(job_id=job_id, channels=channels, mode=mode)
+        job = EnrichmentJob(
+            job_id=job_id,
+            channels=filtered,
+            mode=mode,
+            requested=len(channels),
+            skipped=len(skipped),
+        )
         with self._lock:
             self._jobs[job_id] = job
 
-        if not channels:
+        if not filtered:
             job.mark_done()
             return job
 
-        for channel in channels:
+        for channel in filtered:
             self._executor.submit(self._process_channel, job, channel)
 
         # Emit initial summary to kick off UI progress display.
         job.push_update({"type": "progress", **job.summary()})
         return job
+
+    def _filter_channels(
+        self,
+        channels: List[Dict],
+        *,
+        force_run: bool,
+        never_reenrich: bool,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        if force_run:
+            return list(channels), []
+
+        filtered: List[Dict] = []
+        skipped: List[Dict] = []
+        now = dt.datetime.utcnow()
+        for channel in channels:
+            should_skip = False
+            last_enriched_at = _parse_iso_datetime(channel.get("last_enriched_at"))
+            if never_reenrich and last_enriched_at:
+                should_skip = True
+            else:
+                last_result = str(channel.get("last_enriched_result") or "").lower()
+                if last_result == "no_emails" and last_enriched_at:
+                    if now - last_enriched_at < NO_EMAIL_RETRY_WINDOW:
+                        should_skip = True
+            if should_skip:
+                skipped.append(channel)
+            else:
+                filtered.append(channel)
+        return filtered, skipped
 
     def stream(self, job_id: str):
         job = self._jobs.get(job_id)
@@ -160,6 +219,8 @@ class EnrichmentManager:
                 status="error",
                 status_reason=reason,
                 last_status_change=error_time,
+                last_enriched_at=error_time,
+                last_enriched_result="error",
             )
             job.update_counts(completed=False)
             job.push_update(
@@ -185,6 +246,8 @@ class EnrichmentManager:
                 status="error",
                 status_reason=reason,
                 last_status_change=error_time,
+                last_enriched_at=error_time,
+                last_enriched_result="error",
             )
             job.update_counts(completed=False)
             job.push_update(
@@ -207,6 +270,7 @@ class EnrichmentManager:
             database.record_channel_emails(channel_id, enriched_emails, success_time)
         emails = ", ".join(enriched_emails) if enriched_emails else None
         email_gate_present = enriched.get("email_gate_present")
+        result_value = "emails_found" if enriched_emails else "no_emails"
         database.update_channel_enrichment(
             channel_id,
             name=enriched.get("name") or enriched.get("title") or channel.get("name") or channel.get("title"),
@@ -217,6 +281,8 @@ class EnrichmentManager:
             email_gate_present=email_gate_present,
             last_updated=enriched.get("last_updated") or success_time,
             last_attempted=success_time,
+            last_enriched_at=success_time,
+            last_enriched_result=result_value,
             needs_enrichment=False,
             last_error=None,
             status="completed",
@@ -268,6 +334,8 @@ class EnrichmentManager:
                     channel_id,
                     emails=emails_value,
                     email_gate_present=False,
+                    last_enriched_at=start_time if display_emails or stored_emails else None,
+                    last_enriched_result="emails_found" if display_emails or stored_emails else None,
                 )
             job.update_counts(completed=True)
             job.push_update(
@@ -314,6 +382,11 @@ class EnrichmentManager:
                     "mode": job.mode,
                 }
             )
+            database.update_channel_enrichment(
+                channel_id,
+                last_enriched_at=error_time,
+                last_enriched_result="error",
+            )
             if job.completed + job.errors >= job.total:
                 job.mark_done()
             return
@@ -331,6 +404,11 @@ class EnrichmentManager:
                     "mode": job.mode,
                 }
             )
+            database.update_channel_enrichment(
+                channel_id,
+                last_enriched_at=error_time,
+                last_enriched_result="error",
+            )
             if job.completed + job.errors >= job.total:
                 job.mark_done()
             return
@@ -342,11 +420,14 @@ class EnrichmentManager:
         emails_value = ", ".join(emails) if emails else None
         last_updated = enriched.get("last_updated") or success_time
         email_gate_present = enriched.get("email_gate_present")
+        result_value = "emails_found" if emails else "no_emails"
         database.update_channel_enrichment(
             channel_id,
             emails=emails_value,
             last_updated=last_updated,
             email_gate_present=email_gate_present,
+            last_enriched_at=success_time,
+            last_enriched_result=result_value,
         )
 
         job.update_counts(completed=True)

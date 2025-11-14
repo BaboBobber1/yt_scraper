@@ -358,8 +358,24 @@ def api_enrich(payload: Dict[str, Any] = Body(default={})) -> JSONResponse:
     if mode not in {"full", "email_only"}:
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'email_only'")
 
-    job = manager.start_job(limit, mode=mode)
-    return JSONResponse({"jobId": job.job_id, "total": job.total, "mode": job.mode})
+    force_run = bool(payload.get("forceRun"))
+    never_reenrich = bool(payload.get("neverReenrich"))
+
+    job = manager.start_job(
+        limit,
+        mode=mode,
+        force_run=force_run,
+        never_reenrich=never_reenrich,
+    )
+    return JSONResponse(
+        {
+            "jobId": job.job_id,
+            "total": job.total,
+            "mode": job.mode,
+            "requested": job.requested,
+            "skipped": job.skipped,
+        }
+    )
 
 
 @app.get("/api/enrich/stream/{job_id}")
