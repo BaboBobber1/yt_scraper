@@ -277,6 +277,13 @@ class ChannelSearchResult:
     subscribers: Optional[int]
 
 
+@dataclass
+class DiscoveryMetadata:
+    last_upload: Optional[str] = None
+    language: Optional[str] = None
+    language_confidence: Optional[float] = None
+
+
 @dataclass(frozen=True)
 class ChannelResolution:
     channel_id: str
@@ -441,6 +448,55 @@ def search_channels(keyword: str, limit: int) -> List[ChannelSearchResult]:
             break
 
     return results
+
+
+def fetch_discovery_metadata(channel_id: str) -> DiscoveryMetadata:
+    """Return lightweight metadata useful during discovery filtering."""
+
+    try:
+        _, feed_description, video = _fetch_rss(channel_id)
+    except EnrichmentError:
+        return DiscoveryMetadata()
+    except requests.RequestException:
+        return DiscoveryMetadata()
+
+    video_id = video.get("video_id") if isinstance(video, dict) else None
+    watch_data: Dict[str, Optional[str]] = {}
+    if video_id:
+        try:
+            watch_data = _fetch_watch_details(video_id)
+        except EnrichmentError:
+            watch_data = {}
+        except requests.RequestException:
+            watch_data = {}
+
+    combined_texts = [
+        video.get("title", "") if isinstance(video, dict) else "",
+        video.get("description", "") if isinstance(video, dict) else "",
+        feed_description or "",
+        watch_data.get("description", "") if isinstance(watch_data, dict) else "",
+    ]
+    lang_result = detect_language("\n".join(filter(None, combined_texts)))
+
+    language = None
+    confidence: Optional[float] = None
+    if lang_result:
+        language = lang_result.get("language")
+        confidence = lang_result.get("confidence")
+    elif isinstance(watch_data, dict):
+        language = watch_data.get("language") or None
+
+    last_upload = None
+    if isinstance(watch_data, dict):
+        last_upload = watch_data.get("upload_date") or video.get("timestamp")
+    elif isinstance(video, dict):
+        last_upload = video.get("timestamp")
+
+    return DiscoveryMetadata(
+        last_upload=last_upload,
+        language=language,
+        language_confidence=confidence,
+    )
 
 
 def detect_language(text: str) -> Optional[Dict[str, float]]:

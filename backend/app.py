@@ -15,6 +15,8 @@ from .database import ChannelCategory, ChannelFilters, ensure_channel_url
 from .enrichment import manager
 from .youtube import (
     ChannelResolution,
+    DiscoveryMetadata,
+    fetch_discovery_metadata,
     normalize_channel_reference,
     resolve_channel,
     sanitize_channel_input,
@@ -104,6 +106,24 @@ def _collect_filters(
     )
 
 
+def _parse_iso_datetime(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    candidate = candidate.replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
 def _parse_category(value: Optional[str]) -> ChannelCategory:
     if value is None:
         return ChannelCategory.ACTIVE
@@ -131,8 +151,43 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     if not isinstance(keywords, list) or per_keyword <= 0:
         raise HTTPException(status_code=400, detail="Invalid payload")
 
-    now = dt.datetime.utcnow().isoformat()
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now = now_dt.isoformat()
     new_channels: List[Dict[str, Any]] = []
+    blacklisted_candidates = 0
+
+    max_age_value = payload.get("last_upload_max_age_days")
+    if max_age_value is None:
+        max_age_value = payload.get("lastUploadMaxAgeDays")
+    last_upload_max_age_days: Optional[int] = None
+    if max_age_value not in {None, "", []}:
+        try:
+            last_upload_max_age_days = int(max_age_value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail="last_upload_max_age_days must be an integer"
+            )
+        if last_upload_max_age_days < 0:
+            raise HTTPException(
+                status_code=400, detail="last_upload_max_age_days cannot be negative"
+            )
+
+    deny_languages_raw = payload.get("deny_languages")
+    if deny_languages_raw is None:
+        deny_languages_raw = payload.get("denyLanguages")
+    deny_languages: Set[str] = set()
+    if isinstance(deny_languages_raw, str):
+        candidates = [segment.strip() for segment in deny_languages_raw.split(",")]
+        deny_languages = {value.lower() for value in candidates if value}
+    elif isinstance(deny_languages_raw, list):
+        deny_languages = {
+            str(value).strip().lower()
+            for value in deny_languages_raw
+            if isinstance(value, (str, int, float)) and str(value).strip()
+        }
+
+    requires_metadata = bool(deny_languages or last_upload_max_age_days is not None)
+    metadata_cache: Dict[str, DiscoveryMetadata] = {}
 
     for keyword in keywords:
         if not isinstance(keyword, str):
@@ -149,6 +204,48 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
             if database.is_blacklisted(result.channel_id):
                 database.ensure_blacklisted_channel(result.channel_id, now)
                 continue
+
+            metadata: Optional[DiscoveryMetadata] = None
+            if requires_metadata:
+                metadata = metadata_cache.get(result.channel_id)
+                if metadata is None:
+                    metadata = fetch_discovery_metadata(result.channel_id)
+                    metadata_cache[result.channel_id] = metadata
+
+            violations: List[str] = []
+            if deny_languages and metadata and metadata.language:
+                language_value = str(metadata.language).strip()
+                if language_value and language_value.lower() in deny_languages:
+                    violations.append(
+                        f"Language '{language_value}' denied during discovery"
+                    )
+
+            if (
+                last_upload_max_age_days is not None
+                and metadata
+                and metadata.last_upload
+            ):
+                last_upload_dt = _parse_iso_datetime(metadata.last_upload)
+                if last_upload_dt is not None:
+                    last_upload_utc = last_upload_dt.astimezone(dt.timezone.utc)
+                    age = now_dt - last_upload_utc
+                    if age > dt.timedelta(days=last_upload_max_age_days):
+                        violations.append(
+                            "Last upload is older than "
+                            f"{last_upload_max_age_days} days (last: {last_upload_utc.date().isoformat()})"
+                        )
+
+            if violations:
+                database.ensure_blacklisted_channel(
+                    result.channel_id,
+                    now,
+                    url=ensure_channel_url(result.channel_id, result.url),
+                    name=result.title,
+                    reason="; ".join(violations),
+                )
+                blacklisted_candidates += 1
+                continue
+
             new_channels.append(
                 {
                     "channel_id": result.channel_id,
@@ -169,10 +266,23 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                 }
             )
 
+            if metadata:
+                channel_record = new_channels[-1]
+                if metadata.last_upload:
+                    channel_record["last_updated"] = metadata.last_upload
+                if metadata.language:
+                    channel_record["language"] = metadata.language
+                if metadata.language_confidence is not None:
+                    channel_record["language_confidence"] = metadata.language_confidence
+
     inserted = database.bulk_insert_channels(new_channels)
     totals = database.get_channel_totals()
 
-    return JSONResponse({"found": inserted, "uniqueTotal": totals["total"]})
+    response_payload = {"found": inserted, "uniqueTotal": totals["total"]}
+    if blacklisted_candidates:
+        response_payload["blacklisted"] = blacklisted_candidates
+
+    return JSONResponse(response_payload)
 
 
 @app.post("/api/blacklist/import")

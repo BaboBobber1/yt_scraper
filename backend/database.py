@@ -268,6 +268,7 @@ def ensure_blacklisted_channel(
     *,
     url: Optional[str] = None,
     name: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> Tuple[bool, bool]:
     """Ensure a record exists for the channel in the blacklist tables."""
 
@@ -277,6 +278,10 @@ def ensure_blacklisted_channel(
     resolved_name = name.strip() if isinstance(name, str) else name
     if resolved_name == "":
         resolved_name = None
+
+    status_reason = reason.strip() if isinstance(reason, str) else None
+    if status_reason == "":
+        status_reason = None
 
     with get_cursor() as cursor:
         cursor.execute(
@@ -301,6 +306,8 @@ def ensure_blacklisted_channel(
             (channel_id,),
         )
         existing = cursor.fetchone()
+        resolved_reason = status_reason or "Blacklisted"
+
         if existing is None:
             payload = {
                 "channel_id": channel_id,
@@ -316,7 +323,7 @@ def ensure_blacklisted_channel(
                 "needs_enrichment": 0,
                 "last_error": None,
                 "status": "blacklisted",
-                "status_reason": "Blacklisted",
+                "status_reason": resolved_reason,
                 "last_status_change": timestamp,
             }
         else:
@@ -326,7 +333,7 @@ def ensure_blacklisted_channel(
                 url=canonical_url,
                 needs_enrichment=0,
                 status="blacklisted",
-                status_reason="Blacklisted",
+                status_reason=resolved_reason,
                 last_status_change=existing["last_status_change"] or timestamp,
             )
         _insert_or_replace(cursor, CHANNEL_TABLES[ChannelCategory.BLACKLISTED], payload)
