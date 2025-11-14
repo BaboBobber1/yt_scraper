@@ -952,6 +952,53 @@ def api_export_bundle() -> StreamingResponse:
     return StreamingResponse(buffer, media_type="application/zip", headers=headers)
 
 
+@app.post("/api/import/bundle")
+async def api_import_bundle(
+    file: UploadFile = File(...),
+    dry_run: bool = Query(False, alias="dryRun"),
+) -> JSONResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing bundle archive")
+
+    try:
+        raw_bytes = await file.read()
+    except Exception as exc:  # pragma: no cover - defensive I/O handling
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {exc}") from exc
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded bundle is empty")
+
+    try:
+        bundle_file = io.BytesIO(raw_bytes)
+        with zipfile.ZipFile(bundle_file) as bundle:
+            try:
+                data_bytes = bundle.read("data.json")
+            except KeyError as exc:
+                raise HTTPException(status_code=400, detail="Bundle archive is missing data.json") from exc
+
+            meta: Optional[Dict[str, Any]] = None
+            if "meta.json" in bundle.namelist():
+                try:
+                    meta_bytes = bundle.read("meta.json")
+                    meta = json.loads(meta_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise HTTPException(status_code=400, detail=f"meta.json is invalid: {exc}") from exc
+
+            try:
+                data = json.loads(data_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=400, detail=f"data.json is invalid: {exc}") from exc
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid bundle archive") from exc
+
+    try:
+        summary = database.restore_project_bundle(data, meta=meta, dry_run=dry_run)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JSONResponse(summary)
+
+
 @app.get("/api/stats")
 def api_stats() -> JSONResponse:
     totals = database.get_channel_totals()
