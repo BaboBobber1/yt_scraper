@@ -5,6 +5,7 @@ import {
   blacklistChannels,
   discoverChannels,
   downloadCsv,
+  downloadBundle,
   fetchChannels,
   fetchStats,
   importBlacklist,
@@ -175,6 +176,7 @@ class Dashboard {
       bulkPrimaryBtn: this.root.querySelector('#bulkPrimaryBtn'),
       bulkSecondaryBtn: this.root.querySelector('#bulkSecondaryBtn'),
       exportCsvBtn: this.root.querySelector('#exportCsvBtn'),
+      exportBundleBtn: this.root.querySelector('#exportBundleBtn'),
       sortSelect: this.root.querySelector('#sortSelect'),
       orderSelect: this.root.querySelector('#orderSelect'),
       tableBody: this.root.querySelector('#tableBody'),
@@ -282,6 +284,7 @@ class Dashboard {
     this.el.bulkPrimaryBtn.addEventListener('click', () => this.handleBulkPrimary());
     this.el.bulkSecondaryBtn.addEventListener('click', () => this.handleBulkSecondary());
     this.el.exportCsvBtn.addEventListener('click', () => this.handleExportCsv());
+    this.el.exportBundleBtn?.addEventListener('click', () => this.handleExportBundle());
 
     this.el.discoverBtn.addEventListener('click', () => this.handleDiscover());
     this.el.discoverRunBtn?.addEventListener('click', () => this.startDiscoveryLoop());
@@ -529,6 +532,9 @@ class Dashboard {
     }
     if (this.el.exportCsvBtn) {
       this.el.exportCsvBtn.disabled = loadingState;
+    }
+    if (this.el.exportBundleBtn) {
+      this.el.exportBundleBtn.disabled = loadingState;
     }
 
     this.el.tabButtons.forEach((button) => {
@@ -848,6 +854,32 @@ class Dashboard {
     } catch (error) {
       console.error('CSV export failed', error);
       this.updateStatusBar(error instanceof Error ? error.message : 'CSV export failed.', 'error');
+    }
+  }
+
+  async handleExportBundle() {
+    try {
+      this.setProgress('Preparing project backup…');
+      const { blob, exportTimestamp } = await downloadBundle();
+      const url = URL.createObjectURL(blob);
+      const timestampSource = exportTimestamp || new Date().toISOString();
+      const timestamp = timestampSource.replace(/[:.]/g, '-');
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `project-bundle-${timestamp}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      this.updateStatusBar('Project bundle exported successfully.', 'success');
+    } catch (error) {
+      console.error('Project bundle export failed', error);
+      this.updateStatusBar(
+        error instanceof Error ? error.message : 'Project bundle export failed.',
+        'error',
+      );
+    } finally {
+      this.setProgress('');
     }
   }
 

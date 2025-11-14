@@ -157,6 +157,21 @@ export async function downloadCsv(category, filters, sort, order, options = {}) 
   return { csv: csvText, exportTimestamp };
 }
 
+export async function downloadBundle() {
+  const response = await fetch('/api/export/bundle', {
+    headers: {
+      Accept: 'application/zip, application/octet-stream',
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || 'Failed to export project bundle');
+  }
+  const exportTimestamp = response.headers.get('x-export-timestamp');
+  const blob = await response.blob();
+  return { blob, exportTimestamp };
+}
+
 export async function importBlacklist(file) {
   const formData = new FormData();
   formData.append('file', file);
