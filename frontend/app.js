@@ -217,6 +217,8 @@ class Dashboard {
       summaryBar: this.root.querySelector('#summaryBar'),
       discoverKeywords: this.root.querySelector('#discoverKeywords'),
       discoverPerKeyword: this.root.querySelector('#discoverPerKeyword'),
+      discoverDenyLanguages: this.root.querySelector('#discoverDenyLanguages'),
+      discoverLastUploadMaxAge: this.root.querySelector('#discoverLastUploadMaxAge'),
       discoverBtn: this.root.querySelector('#discoverBtn'),
       enrichBtn: this.root.querySelector('#enrichBtn'),
       enrichEmailBtn: this.root.querySelector('#enrichEmailBtn'),
@@ -868,17 +870,46 @@ class Dashboard {
       .filter(Boolean);
   }
 
+  parseDenyLanguagesInput() {
+    if (!this.el.discoverDenyLanguages) {
+      return [];
+    }
+    return this.el.discoverDenyLanguages.value
+      .split(/[\s,]+/)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
   async handleDiscover() {
     const keywords = this.parseKeywordsInput();
     const perKeyword = Number(this.el.discoverPerKeyword.value) || 5;
+    const denyLanguages = this.parseDenyLanguagesInput();
+    const maxAgeRaw = this.el.discoverLastUploadMaxAge?.value ?? '';
+    let lastUploadMaxAge = null;
+    if (maxAgeRaw.trim() !== '') {
+      const parsed = Number(maxAgeRaw);
+      if (Number.isNaN(parsed) || parsed < 0) {
+        this.updateStatusBar('Last upload max age must be zero or greater.', 'error');
+        return;
+      }
+      lastUploadMaxAge = Math.floor(parsed);
+    }
     if (!keywords.length) {
       this.updateStatusBar('Please provide at least one keyword.', 'error');
       return;
     }
     try {
       this.updateStatusBar('Starting discovery…', 'info');
-      const response = await discoverChannels(keywords, perKeyword);
-      this.updateStatusBar(`Discovered ${response.found} new channels.`, 'success');
+      const response = await discoverChannels(keywords, perKeyword, {
+        denyLanguages,
+        lastUploadMaxAgeDays: lastUploadMaxAge,
+      });
+      let message = `Discovered ${response.found} new channels.`;
+      if (response.blacklisted) {
+        const suffix = response.blacklisted === 1 ? 'candidate' : 'candidates';
+        message += ` Blacklisted ${response.blacklisted} ${suffix}.`;
+      }
+      this.updateStatusBar(message, 'success');
       await this.loadStats();
       await this.loadTable(Category.ACTIVE, (state) => ({ ...state, loading: true }));
     } catch (error) {

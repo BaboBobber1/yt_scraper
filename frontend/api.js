@@ -107,10 +107,17 @@ export async function restoreByFilter(category, filters, sort, order, limit, pag
   });
 }
 
-export async function discoverChannels(keywords, perKeyword) {
+export async function discoverChannels(keywords, perKeyword, options = {}) {
+  const payload = { keywords, perKeyword };
+  if (options.lastUploadMaxAgeDays != null) {
+    payload.last_upload_max_age_days = options.lastUploadMaxAgeDays;
+  }
+  if (Array.isArray(options.denyLanguages) && options.denyLanguages.length) {
+    payload.deny_languages = options.denyLanguages;
+  }
   return request('/api/discover', {
     method: 'POST',
-    body: JSON.stringify({ keywords, perKeyword }),
+    body: JSON.stringify(payload),
   });
 }
 
