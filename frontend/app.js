@@ -191,6 +191,10 @@ class Dashboard {
     this.pendingAutoEnrich = 0;
     this.autoEnrichQueuedNotified = false;
     this.discoverySettings = defaultDiscoverySettingsState();
+    this.activeDropdown = null;
+    this.activeDropdownToggle = null;
+    this.handleDocumentClick = this.handleDocumentClick.bind(this);
+    this.handleDocumentKeydown = this.handleDocumentKeydown.bind(this);
   }
 
   init() {
@@ -219,6 +223,8 @@ class Dashboard {
       bulkSecondaryBtn: this.root.querySelector('#bulkSecondaryBtn'),
       exportCsvBtn: this.root.querySelector('#exportCsvBtn'),
       exportBundleBtn: this.root.querySelector('#exportBundleBtn'),
+      importExportToggle: this.root.querySelector('#importExportToggle'),
+      importExportMenu: this.root.querySelector('#importExportMenu'),
       sortSelect: this.root.querySelector('#sortSelect'),
       orderSelect: this.root.querySelector('#orderSelect'),
       tableBody: this.root.querySelector('#tableBody'),
@@ -234,7 +240,6 @@ class Dashboard {
       discoverDenyLanguages: document.getElementById('discoverDenyLanguages'),
       discoverLastUploadMaxAge: document.getElementById('discoverLastUploadMaxAge'),
       discoverBtn: this.root.querySelector('#discoverBtn'),
-      discoverSettingsBtn: this.root.querySelector('#discoverSettingsBtn'),
       discoverSummary: this.root.querySelector('#discoverSummary'),
       discoverStopBtn: this.root.querySelector('#discoverStopBtn'),
       discoverRunCounter: this.root.querySelector('#discoverRunCounter'),
@@ -247,6 +252,8 @@ class Dashboard {
       discoverSettingsForm: document.getElementById('discoverSettingsForm'),
       discoverSettingsStart: document.getElementById('discoverSettingsStartBtn'),
       enrichBtn: this.root.querySelector('#enrichBtn'),
+      enrichMenu: this.root.querySelector('#enrichMenu'),
+      enrichMenuFullBtn: this.root.querySelector('#enrichMenuFullBtn'),
       enrichEmailBtn: this.root.querySelector('#enrichEmailBtn'),
       enrichLimit: document.getElementById('enrichLimit'),
       enrichForceToggle: this.root.querySelector('#enrichForceToggle'),
@@ -333,14 +340,46 @@ class Dashboard {
 
     this.el.bulkPrimaryBtn.addEventListener('click', () => this.handleBulkPrimary());
     this.el.bulkSecondaryBtn.addEventListener('click', () => this.handleBulkSecondary());
-    this.el.exportCsvBtn.addEventListener('click', () => this.handleExportCsv());
-    this.el.exportBundleBtn?.addEventListener('click', () => this.handleExportBundle());
-
     this.el.discoverBtn.addEventListener('click', () => this.openDiscoverSettings());
-    this.el.discoverSettingsBtn?.addEventListener('click', () => this.openDiscoverSettings());
     this.el.discoverStopBtn?.addEventListener('click', () => this.stopDiscoveryLoop());
-    this.el.enrichBtn.addEventListener('click', () => this.handleEnrich('full'));
-    this.el.enrichEmailBtn.addEventListener('click', () => this.handleEnrich('email_only'));
+
+    this.el.importExportToggle?.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.toggleDropdown(this.el.importExportToggle, this.el.importExportMenu);
+    });
+    this.el.importExportMenu?.addEventListener('click', (event) => {
+      event.stopPropagation();
+    });
+    this.el.exportCsvBtn?.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.closeDropdown(this.el.importExportMenu, this.el.importExportToggle);
+      this.handleExportCsv();
+    });
+    this.el.exportBundleBtn?.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.closeDropdown(this.el.importExportMenu, this.el.importExportToggle);
+      this.handleExportBundle();
+    });
+
+    this.el.enrichBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.toggleDropdown(this.el.enrichBtn, this.el.enrichMenu);
+    });
+    this.el.enrichMenu?.addEventListener('click', (event) => {
+      event.stopPropagation();
+    });
+    this.el.enrichMenuFullBtn?.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.closeDropdown(this.el.enrichMenu, this.el.enrichBtn);
+      this.handleEnrich('full');
+    });
+    this.el.enrichEmailBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.closeDropdown(this.el.enrichMenu, this.el.enrichBtn);
+      this.handleEnrich('email_only');
+    });
 
     this.el.discoverAutoEnrichToggle?.addEventListener('change', () => {
       if (this.el.discoverAutoEnrichMode) {
@@ -360,7 +399,11 @@ class Dashboard {
       await this.handleDiscoverSettingsSubmit();
     });
 
-    this.el.importBlacklistBtn.addEventListener('click', () => this.openModal());
+    this.el.importBlacklistBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.closeDropdown(this.el.importExportMenu, this.el.importExportToggle);
+      this.openModal();
+    });
     this.el.modalClose.addEventListener('click', () => this.closeModal());
     this.el.modalCancel.addEventListener('click', () => this.closeModal());
     this.el.modal.addEventListener('click', (event) => {
@@ -373,6 +416,9 @@ class Dashboard {
       event.preventDefault();
       this.handleBlacklistImport();
     });
+
+    document.addEventListener('click', this.handleDocumentClick);
+    document.addEventListener('keydown', this.handleDocumentKeydown);
   }
 
   loadDiscoverySettings() {
@@ -527,6 +573,7 @@ class Dashboard {
     if (!this.el.discoverSettingsModal) {
       return;
     }
+    this.closeAllDropdowns();
     if (this.discoveryLoopActive) {
       this.updateStatusBar(
         'Discovery loop is running. Stop it before changing settings.',
@@ -1298,6 +1345,7 @@ class Dashboard {
   }
 
   async handleEnrich(mode, overrides = {}) {
+    this.closeDropdown(this.el.enrichMenu, this.el.enrichBtn);
     if (this.enrichmentBusy) {
       return;
     }
@@ -1317,6 +1365,9 @@ class Dashboard {
       this.autoEnrichQueuedNotified = false;
       this.el.enrichBtn.disabled = true;
       this.el.enrichEmailBtn.disabled = true;
+      if (this.el.enrichMenuFullBtn) {
+        this.el.enrichMenuFullBtn.disabled = true;
+      }
       this.renderTable();
       const options = {
         forceRun: this.el.enrichForceToggle?.checked ?? false,
@@ -1345,6 +1396,9 @@ class Dashboard {
       this.enrichmentBusy = false;
       this.el.enrichBtn.disabled = false;
       this.el.enrichEmailBtn.disabled = false;
+      if (this.el.enrichMenuFullBtn) {
+        this.el.enrichMenuFullBtn.disabled = false;
+      }
       this.renderTable();
       if (autoTriggered && limitValue != null && limitValue > 0) {
         this.pendingAutoEnrich += Number(limitValue);
@@ -1476,9 +1530,6 @@ class Dashboard {
     if (this.el.discoverBtn) {
       this.el.discoverBtn.disabled = running;
     }
-    if (this.el.discoverSettingsBtn) {
-      this.el.discoverSettingsBtn.disabled = running;
-    }
     if (this.el.discoverStopBtn) {
       if (running) {
         this.el.discoverStopBtn.removeAttribute('hidden');
@@ -1514,6 +1565,66 @@ class Dashboard {
     });
   }
 
+  toggleDropdown(toggleEl, menuEl) {
+    if (!toggleEl || !menuEl || toggleEl.disabled) {
+      return;
+    }
+    if (this.activeDropdown === menuEl) {
+      this.closeDropdown(menuEl, toggleEl);
+      return;
+    }
+    this.closeAllDropdowns();
+    menuEl.removeAttribute('hidden');
+    toggleEl.setAttribute('aria-expanded', 'true');
+    this.activeDropdown = menuEl;
+    this.activeDropdownToggle = toggleEl;
+  }
+
+  closeDropdown(menuEl, toggleEl = null) {
+    if (!menuEl) {
+      return;
+    }
+    menuEl.setAttribute('hidden', 'true');
+    const toggle = toggleEl || this.activeDropdownToggle;
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', 'false');
+    }
+    if (this.activeDropdown === menuEl) {
+      this.activeDropdown = null;
+      this.activeDropdownToggle = null;
+    }
+  }
+
+  closeAllDropdowns() {
+    if (this.activeDropdown) {
+      this.closeDropdown(this.activeDropdown, this.activeDropdownToggle);
+    }
+  }
+
+  handleDocumentClick(event) {
+    if (!this.activeDropdown) {
+      return;
+    }
+    const target = event.target;
+    if (typeof Node === 'undefined' || !(target instanceof Node)) {
+      this.closeAllDropdowns();
+      return;
+    }
+    if (
+      this.activeDropdown.contains(target) ||
+      (this.activeDropdownToggle && this.activeDropdownToggle.contains(target))
+    ) {
+      return;
+    }
+    this.closeAllDropdowns();
+  }
+
+  handleDocumentKeydown(event) {
+    if (event.key === 'Escape') {
+      this.closeAllDropdowns();
+    }
+  }
+
   openEventSource(jobId, total) {
     if (this.eventSource) {
       this.eventSource.close();
@@ -1539,6 +1650,9 @@ class Dashboard {
             this.enrichmentBusy = false;
             this.el.enrichBtn.disabled = false;
             this.el.enrichEmailBtn.disabled = false;
+            if (this.el.enrichMenuFullBtn) {
+              this.el.enrichMenuFullBtn.disabled = false;
+            }
             this.setProgress('');
             const skipped = payload.skipped ?? 0;
             const requested = payload.requested;
@@ -1582,11 +1696,15 @@ class Dashboard {
       this.enrichmentBusy = false;
       this.el.enrichBtn.disabled = false;
       this.el.enrichEmailBtn.disabled = false;
+      if (this.el.enrichMenuFullBtn) {
+        this.el.enrichMenuFullBtn.disabled = false;
+      }
       this.renderTable();
     };
   }
 
   openModal() {
+    this.closeAllDropdowns();
     this.el.modal.removeAttribute('hidden');
     this.el.modalSummary.innerHTML = '';
     this.el.modalSummary.className = 'modal-summary';

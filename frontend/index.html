@@ -25,21 +25,62 @@
               <span class="btn-icon">🔍</span>
               Discover
             </button>
-            <button class="btn btn--ghost" id="discoverSettingsBtn" type="button">
-              <span class="btn-icon">⚙️</span>
-              Discover settings
-            </button>
           </div>
           <p class="discover-summary" id="discoverSummary">
             Configure discovery keywords and filters to get started.
           </p>
         </div>
         <div class="discover-utilities">
-          <button class="btn btn--green" id="enrichBtn"><span class="btn-icon">⚙️</span>Enrich</button>
-          <button class="btn btn--green" id="enrichEmailBtn"><span class="btn-icon">✉️</span>Enrich (Email-only)</button>
-          <button class="btn btn--green" id="exportCsvBtn"><span class="btn-icon">⬇️</span>Export CSV</button>
-          <button class="btn btn--green" id="exportBundleBtn"><span class="btn-icon">🧰</span>Export Bundle</button>
-          <button class="btn btn--green" id="importBlacklistBtn"><span class="btn-icon">📥</span>Import blacklist (CSV)</button>
+          <div class="action-group">
+            <button
+              class="btn btn--green btn--menu"
+              id="importExportToggle"
+              type="button"
+              aria-haspopup="true"
+              aria-expanded="false"
+            >
+              <span class="btn-icon">📦</span>
+              Import / Export
+              <span class="btn-caret">▾</span>
+            </button>
+            <div class="dropdown-menu" id="importExportMenu" role="menu" hidden>
+              <button class="dropdown-menu__item" id="exportCsvBtn" type="button">
+                <span class="btn-icon">⬇️</span>
+                Export CSV
+              </button>
+              <button class="dropdown-menu__item" id="exportBundleBtn" type="button">
+                <span class="btn-icon">🧰</span>
+                Export bundle
+              </button>
+              <button class="dropdown-menu__item" id="importBlacklistBtn" type="button">
+                <span class="btn-icon">📥</span>
+                Import blacklist (CSV)
+              </button>
+            </div>
+          </div>
+          <div class="action-group">
+            <button
+              class="btn btn--green btn--menu"
+              id="enrichBtn"
+              type="button"
+              aria-haspopup="true"
+              aria-expanded="false"
+            >
+              <span class="btn-icon">⚙️</span>
+              Enrich
+              <span class="btn-caret">▾</span>
+            </button>
+            <div class="dropdown-menu" id="enrichMenu" role="menu" hidden>
+              <button class="dropdown-menu__item" id="enrichMenuFullBtn" type="button">
+                <span class="btn-icon">⚙️</span>
+                Enrich (full)
+              </button>
+              <button class="dropdown-menu__item" id="enrichEmailBtn" type="button">
+                <span class="btn-icon">✉️</span>
+                Enrich (Email-only)
+              </button>
+            </div>
+          </div>
         </div>
         <div class="discover-runner">
           <button class="btn btn--red" id="discoverStopBtn" hidden>
@@ -233,7 +274,7 @@
         <div class="modal-footer">
           <button type="button" class="btn btn--outline" id="discoverSettingsCancelBtn">Cancel</button>
           <button type="submit" form="discoverSettingsForm" class="btn btn--green" id="discoverSettingsStartBtn">
-            <span class="btn-icon">🔍</span>Start discover
+            <span class="btn-icon">🔍</span>Start discovery
           </button>
         </div>
       </div>
