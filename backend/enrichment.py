@@ -254,7 +254,7 @@ class EnrichmentManager:
                 last_enriched_at
                 and last_result == "no_emails"
                 and not has_emails
-                and status not in {"error", "failed", "feed_unavailable", "invalid_channel"}
+                and status in {"completed", RECENT_NO_EMAIL_STATUS}
                 and now - last_enriched_at < cooldown
             ):
                 should_skip = True
