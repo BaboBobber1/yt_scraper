@@ -6,14 +6,22 @@ import datetime as dt
 import io
 import json
 import zipfile
-from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import database
-from .database import ChannelCategory, ChannelFilters, ensure_channel_url
+from .database import (
+    ChannelCategory,
+    ChannelFilters,
+    channel_exists,
+    ensure_channel_url,
+    get_discovery_keyword_state,
+    update_discovery_keyword_state,
+)
 from .enrichment import manager
 from .state import discovery_state
 from .youtube import (
@@ -24,6 +32,7 @@ from .youtube import (
     resolve_channel,
     sanitize_channel_input,
     search_channels,
+    search_channels_page,
 )
 
 app = FastAPI(title="Crypto YouTube Harvester")
@@ -47,6 +56,11 @@ DEFAULT_KEYWORDS = [
     "onchain",
     "crypto trading",
 ]
+
+
+RUN_UNTIL_STOPPED_MAX_PAGES_PER_RUN = 20
+RUN_UNTIL_STOPPED_MAX_NEW_CHANNELS = 200
+RUN_UNTIL_STOPPED_NO_NEW_THRESHOLD = 4
 
 
 def _parse_multi(values: Optional[List[str]]) -> Optional[List[str]]:
@@ -192,28 +206,30 @@ def _parse_category(value: Optional[str]) -> ChannelCategory:
         raise HTTPException(status_code=400, detail=f"category must be one of: {allowed}") from exc
 
 
-@app.get("/")
-def serve_index() -> FileResponse:
-    return FileResponse("frontend/index.html")
+@dataclass
+class DiscoveryProcessingContext:
+    now: str
+    now_dt: dt.datetime
+    deny_languages: Set[str]
+    last_upload_max_age_days: Optional[int]
+    requires_metadata: bool
+    metadata_cache: Dict[str, DiscoveryMetadata]
 
 
-@app.get("/static/{path:path}")
-def serve_static(path: str) -> FileResponse:
-    return FileResponse(f"frontend/{path}")
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        return normalized in {"1", "true", "yes", "on"}
+    return False
 
 
-@app.post("/api/discover")
-def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
-    keywords = payload.get("keywords", DEFAULT_KEYWORDS)
-    per_keyword = int(payload.get("perKeyword", 5))
-    if not isinstance(keywords, list) or per_keyword <= 0:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-
-    now_dt = dt.datetime.now(dt.timezone.utc)
-    now = now_dt.isoformat()
-    new_channels: List[Dict[str, Any]] = []
-    blacklisted_candidates = 0
-
+def _parse_last_upload_max_age(payload: Dict[str, Any]) -> Optional[int]:
     max_age_value = _unwrap_single_value(payload.get("last_upload_max_age_days"))
     if max_age_value in (None, ""):
         max_age_value = _unwrap_single_value(payload.get("lastUploadMaxAgeDays"))
@@ -221,19 +237,22 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
         max_age_value = max_age_value.strip()
     if max_age_value == "":
         max_age_value = None
-    last_upload_max_age_days: Optional[int] = None
-    if max_age_value is not None:
-        try:
-            last_upload_max_age_days = int(max_age_value)
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=400, detail="last_upload_max_age_days must be an integer"
-            )
-        if last_upload_max_age_days < 0:
-            raise HTTPException(
-                status_code=400, detail="last_upload_max_age_days cannot be negative"
-            )
+    if max_age_value is None:
+        return None
+    try:
+        parsed = int(max_age_value)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail="last_upload_max_age_days must be an integer"
+        )
+    if parsed < 0:
+        raise HTTPException(
+            status_code=400, detail="last_upload_max_age_days cannot be negative"
+        )
+    return parsed
 
+
+def _parse_deny_languages(payload: Dict[str, Any]) -> Set[str]:
     deny_languages_raw = payload.get("deny_languages")
     if deny_languages_raw is None:
         deny_languages_raw = payload.get("denyLanguages")
@@ -247,102 +266,417 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
             for value in deny_languages_raw
             if isinstance(value, (str, int, float)) and str(value).strip()
         }
+    return deny_languages
 
+
+def _build_discovery_context(
+    now_dt: dt.datetime, payload: Dict[str, Any]
+) -> DiscoveryProcessingContext:
+    deny_languages = _parse_deny_languages(payload)
+    last_upload_max_age_days = _parse_last_upload_max_age(payload)
     requires_metadata = bool(deny_languages or last_upload_max_age_days is not None)
-    metadata_cache: Dict[str, DiscoveryMetadata] = {}
+    return DiscoveryProcessingContext(
+        now=now_dt.isoformat(),
+        now_dt=now_dt,
+        deny_languages=deny_languages,
+        last_upload_max_age_days=last_upload_max_age_days,
+        requires_metadata=requires_metadata,
+        metadata_cache={},
+    )
+
+
+def _evaluate_discovery_candidate(
+    result: "ChannelSearchResult", context: DiscoveryProcessingContext
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    metadata: Optional[DiscoveryMetadata] = None
+    if context.requires_metadata:
+        metadata = context.metadata_cache.get(result.channel_id)
+        if metadata is None:
+            metadata = fetch_discovery_metadata(result.channel_id)
+            context.metadata_cache[result.channel_id] = metadata
+
+    violations: List[str] = []
+    if context.deny_languages and metadata and metadata.language:
+        language_value = str(metadata.language).strip()
+        if language_value and language_value.lower() in context.deny_languages:
+            violations.append(
+                f"Language '{language_value}' denied during discovery"
+            )
+
+    if (
+        context.last_upload_max_age_days is not None
+        and metadata
+        and metadata.last_upload
+    ):
+        last_upload_dt = _parse_iso_datetime(metadata.last_upload)
+        if last_upload_dt is not None:
+            last_upload_utc = last_upload_dt.astimezone(dt.timezone.utc)
+            age = context.now_dt - last_upload_utc
+            if age > dt.timedelta(days=context.last_upload_max_age_days):
+                violations.append(
+                    "Last upload is older than "
+                    f"{context.last_upload_max_age_days} days (last: {last_upload_utc.date().isoformat()})"
+                )
+
+    if violations:
+        database.ensure_blacklisted_channel(
+            result.channel_id,
+            context.now,
+            url=ensure_channel_url(result.channel_id, result.url),
+            name=result.title,
+            reason="; ".join(violations),
+        )
+        return None, True
+
+    payload: Dict[str, Any] = {
+        "channel_id": result.channel_id,
+        "name": result.title,
+        "url": ensure_channel_url(result.channel_id, result.url),
+        "subscribers": result.subscribers,
+        "created_at": context.now,
+        "last_updated": None,
+        "last_attempted": None,
+        "needs_enrichment": True,
+        "emails": None,
+        "language": None,
+        "language_confidence": None,
+        "last_error": None,
+        "status": "new",
+        "status_reason": None,
+        "last_status_change": context.now,
+    }
+
+    if metadata:
+        if metadata.last_upload:
+            payload["last_updated"] = metadata.last_upload
+        if metadata.language:
+            payload["language"] = metadata.language
+        if metadata.language_confidence is not None:
+            payload["language_confidence"] = metadata.language_confidence
+
+    return payload, False
+
+
+def _process_search_results(
+    results: Iterable["ChannelSearchResult"],
+    *,
+    context: DiscoveryProcessingContext,
+    seen_ids: Set[str],
+    new_channels: List[Dict[str, Any]],
+) -> Tuple[int, int, int]:
+    new_count = 0
+    known_count = 0
+    blacklisted_count = 0
+
+    for result in results:
+        channel_id = (result.channel_id or "").strip().upper()
+        if not channel_id or channel_id in seen_ids:
+            continue
+        seen_ids.add(channel_id)
+
+        if database.is_blacklisted(channel_id):
+            database.ensure_blacklisted_channel(
+                channel_id,
+                context.now,
+                url=ensure_channel_url(channel_id, result.url),
+                name=result.title,
+            )
+            known_count += 1
+            continue
+
+        if channel_exists(channel_id, include_blacklisted=False):
+            known_count += 1
+            continue
+
+        payload, flagged = _evaluate_discovery_candidate(result, context)
+        if flagged:
+            blacklisted_count += 1
+            continue
+        if payload:
+            new_channels.append(payload)
+            new_count += 1
+
+    return new_count, known_count, blacklisted_count
+
+
+def _run_until_stopped_discovery(
+    keyword: str,
+    per_keyword: int,
+    *,
+    context: DiscoveryProcessingContext,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    state = get_discovery_keyword_state(keyword)
+    page_index = max(0, int(state.page_index))
+    next_token = state.next_page_token
+    consecutive_no_new = max(0, int(state.no_new_pages))
+    exhausted_flag = False
+    stop_requested = False
+
+    seen_ids: Set[str] = set()
+    new_channels: List[Dict[str, Any]] = []
+    total_known = 0
+    total_blacklisted = 0
+    pages_processed = 0
+
+    target_new_limit = max(1, int(per_keyword))
+    target_new_limit = min(target_new_limit, RUN_UNTIL_STOPPED_MAX_NEW_CHANNELS)
+    max_pages = max(1, RUN_UNTIL_STOPPED_MAX_PAGES_PER_RUN)
+    no_new_threshold = max(1, RUN_UNTIL_STOPPED_NO_NEW_THRESHOLD)
+
+    current_token = next_token
+    session = None
+    last_run_timestamp: Optional[str] = None
+
+    if page_index > 0 and not current_token:
+        exhausted_flag = True
+    else:
+        try:
+            initial_page = search_channels_page(keyword)
+        except Exception as exc:  # pragma: no cover - network errors
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to search for keyword '{keyword}': {exc}",
+            ) from exc
+        session = initial_page.session
+        if page_index == 0:
+            new_in_page, known_in_page, blacklisted_in_page = _process_search_results(
+                initial_page.results,
+                context=context,
+                seen_ids=seen_ids,
+                new_channels=new_channels,
+            )
+            total_known += known_in_page
+            total_blacklisted += blacklisted_in_page
+            pages_processed += 1
+            if new_in_page == 0:
+                consecutive_no_new += 1
+            else:
+                consecutive_no_new = 0
+            page_index += 1
+            current_token = initial_page.next_page_token
+            if current_token is None:
+                exhausted_flag = True
+            timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+            update_discovery_keyword_state(
+                keyword,
+                next_page_token=current_token,
+                page_index=page_index,
+                last_run_at=timestamp,
+                exhausted=exhausted_flag,
+                no_new_pages=consecutive_no_new,
+            )
+            last_run_timestamp = timestamp
+        else:
+            current_token = next_token
+
+    while (
+        not exhausted_flag
+        and not stop_requested
+        and current_token
+        and pages_processed < max_pages
+        and len(new_channels) < target_new_limit
+    ):
+        if session is None:
+            exhausted_flag = True
+            break
+        try:
+            page = search_channels_page(
+                keyword, session=session, continuation_token=current_token
+            )
+        except Exception as exc:  # pragma: no cover - network errors
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to continue search for keyword '{keyword}': {exc}",
+            ) from exc
+
+        new_in_page, known_in_page, blacklisted_in_page = _process_search_results(
+            page.results,
+            context=context,
+            seen_ids=seen_ids,
+            new_channels=new_channels,
+        )
+        total_known += known_in_page
+        total_blacklisted += blacklisted_in_page
+        pages_processed += 1
+        if new_in_page == 0:
+            consecutive_no_new += 1
+        else:
+            consecutive_no_new = 0
+
+        page_index += 1
+        current_token = page.next_page_token
+        if current_token is None:
+            exhausted_flag = True
+
+        if consecutive_no_new >= no_new_threshold:
+            exhausted_flag = True
+
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        update_discovery_keyword_state(
+            keyword,
+            next_page_token=current_token,
+            page_index=page_index,
+            last_run_at=timestamp,
+            exhausted=exhausted_flag,
+            no_new_pages=consecutive_no_new,
+        )
+        last_run_timestamp = timestamp
+
+        if len(new_channels) >= target_new_limit:
+            break
+        if pages_processed >= max_pages:
+            break
+        if exhausted_flag:
+            break
+        if discovery_state.is_stop_requested():
+            stop_requested = True
+            break
+
+    if last_run_timestamp is None:
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        update_discovery_keyword_state(
+            keyword,
+            next_page_token=current_token,
+            page_index=page_index,
+            last_run_at=timestamp,
+            exhausted=exhausted_flag,
+            no_new_pages=consecutive_no_new,
+        )
+        last_run_timestamp = timestamp
+    elif exhausted_flag or stop_requested:
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        update_discovery_keyword_state(
+            keyword,
+            next_page_token=current_token,
+            page_index=page_index,
+            last_run_at=timestamp,
+            exhausted=exhausted_flag,
+            no_new_pages=consecutive_no_new,
+        )
+        last_run_timestamp = timestamp
+
+    inserted = database.bulk_insert_channels(new_channels)
+    totals = database.get_channel_totals()
+
+    response_payload: Dict[str, Any] = {
+        "found": inserted,
+        "uniqueTotal": totals["total"],
+    }
+    if total_blacklisted:
+        response_payload["blacklisted"] = total_blacklisted
+    if total_known:
+        response_payload["known"] = total_known
+
+    session_info = {
+        "keyword": keyword,
+        "newChannels": inserted,
+        "knownChannels": total_known,
+        "pagesProcessed": pages_processed,
+        "nextPageIndex": page_index,
+        "exhausted": exhausted_flag,
+        "stopRequested": stop_requested,
+    }
+
+    return response_payload, session_info
+
+@app.get("/")
+def serve_index() -> FileResponse:
+    return FileResponse("frontend/index.html")
+
+
+@app.get("/static/{path:path}")
+def serve_static(path: str) -> FileResponse:
+    return FileResponse(f"frontend/{path}")
+
+
+@app.post("/api/discover")
+def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+    keywords_raw = payload.get("keywords", DEFAULT_KEYWORDS)
+    if not isinstance(keywords_raw, list):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    try:
+        per_keyword_value = payload.get("perKeyword", 5)
+        per_keyword = int(per_keyword_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="perKeyword must be an integer")
+    if per_keyword <= 0:
+        raise HTTPException(status_code=400, detail="perKeyword must be positive")
+
+    keywords: List[str] = []
+    for value in keywords_raw:
+        if not isinstance(value, str):
+            value = str(value)
+        cleaned = value.strip()
+        if cleaned:
+            keywords.append(cleaned)
+    if not keywords:
+        raise HTTPException(status_code=400, detail="No keywords provided")
+
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    context = _build_discovery_context(now_dt, payload)
+
+    run_flag_payload = _coerce_bool(payload.get("run_until_stopped")) or _coerce_bool(
+        payload.get("runUntilStopped")
+    )
+    loop_snapshot = discovery_state.snapshot()
+    run_flag_state = bool(loop_snapshot.get("running")) and bool(
+        loop_snapshot.get("run_until_stopped")
+    )
+    run_until_stopped = run_flag_payload or run_flag_state
+
+    if run_until_stopped:
+        if len(keywords) != 1:
+            raise HTTPException(
+                status_code=422,
+                detail="Run-until-stopped mode requires exactly one keyword.",
+            )
+        keyword = keywords[0]
+        response_payload, session_info = _run_until_stopped_discovery(
+            keyword, per_keyword, context=context
+        )
+        discovery_state.update_session(
+            keyword=keyword,
+            new=session_info.get("newChannels"),
+            known=session_info.get("knownChannels"),
+            pages=session_info.get("nextPageIndex"),
+            exhausted=session_info.get("exhausted"),
+            run_until_stopped=True,
+        )
+        response_payload["session"] = session_info
+        return JSONResponse(response_payload)
+
+    seen_ids: Set[str] = set()
+    new_channels: List[Dict[str, Any]] = []
+    total_known = 0
+    total_blacklisted = 0
 
     for keyword in keywords:
-        if not isinstance(keyword, str):
-            keyword = str(keyword)
-        keyword = keyword.strip()
-        if not keyword:
-            continue
         try:
             results = search_channels(keyword, per_keyword)
         except Exception as exc:  # pragma: no cover - network errors
             print(f"Failed to search for keyword '{keyword}': {exc}")
             continue
-        for result in results:
-            if database.is_blacklisted(result.channel_id):
-                database.ensure_blacklisted_channel(result.channel_id, now)
-                continue
-
-            metadata: Optional[DiscoveryMetadata] = None
-            if requires_metadata:
-                metadata = metadata_cache.get(result.channel_id)
-                if metadata is None:
-                    metadata = fetch_discovery_metadata(result.channel_id)
-                    metadata_cache[result.channel_id] = metadata
-
-            violations: List[str] = []
-            if deny_languages and metadata and metadata.language:
-                language_value = str(metadata.language).strip()
-                if language_value and language_value.lower() in deny_languages:
-                    violations.append(
-                        f"Language '{language_value}' denied during discovery"
-                    )
-
-            if (
-                last_upload_max_age_days is not None
-                and metadata
-                and metadata.last_upload
-            ):
-                last_upload_dt = _parse_iso_datetime(metadata.last_upload)
-                if last_upload_dt is not None:
-                    last_upload_utc = last_upload_dt.astimezone(dt.timezone.utc)
-                    age = now_dt - last_upload_utc
-                    if age > dt.timedelta(days=last_upload_max_age_days):
-                        violations.append(
-                            "Last upload is older than "
-                            f"{last_upload_max_age_days} days (last: {last_upload_utc.date().isoformat()})"
-                        )
-
-            if violations:
-                database.ensure_blacklisted_channel(
-                    result.channel_id,
-                    now,
-                    url=ensure_channel_url(result.channel_id, result.url),
-                    name=result.title,
-                    reason="; ".join(violations),
-                )
-                blacklisted_candidates += 1
-                continue
-
-            new_channels.append(
-                {
-                    "channel_id": result.channel_id,
-                    "name": result.title,
-                    "url": ensure_channel_url(result.channel_id, result.url),
-                    "subscribers": result.subscribers,
-                    "created_at": now,
-                    "last_updated": None,
-                    "last_attempted": None,
-                    "needs_enrichment": True,
-                    "emails": None,
-                    "language": None,
-                    "language_confidence": None,
-                    "last_error": None,
-                    "status": "new",
-                    "status_reason": None,
-                    "last_status_change": now,
-                }
-            )
-
-            if metadata:
-                channel_record = new_channels[-1]
-                if metadata.last_upload:
-                    channel_record["last_updated"] = metadata.last_upload
-                if metadata.language:
-                    channel_record["language"] = metadata.language
-                if metadata.language_confidence is not None:
-                    channel_record["language_confidence"] = metadata.language_confidence
+        new_in_keyword, known_in_keyword, blacklisted_in_keyword = _process_search_results(
+            results,
+            context=context,
+            seen_ids=seen_ids,
+            new_channels=new_channels,
+        )
+        total_known += known_in_keyword
+        total_blacklisted += blacklisted_in_keyword
 
     inserted = database.bulk_insert_channels(new_channels)
     totals = database.get_channel_totals()
 
-    response_payload = {"found": inserted, "uniqueTotal": totals["total"]}
-    if blacklisted_candidates:
-        response_payload["blacklisted"] = blacklisted_candidates
+    response_payload: Dict[str, Any] = {
+        "found": inserted,
+        "uniqueTotal": totals["total"],
+    }
+    if total_blacklisted:
+        response_payload["blacklisted"] = total_blacklisted
+    if total_known:
+        response_payload["known"] = total_known
 
     return JSONResponse(response_payload)
 
@@ -354,7 +688,13 @@ def api_discovery_loop_start(
     data = payload or {}
     runs = _coerce_non_negative_int(data.get("runs"))
     discovered = _coerce_non_negative_int(data.get("discovered"))
-    state = discovery_state.mark_started(runs=runs, discovered=discovered)
+    run_flag_value = data.get("run_until_stopped")
+    if run_flag_value is None:
+        run_flag_value = data.get("runUntilStopped")
+    run_flag = _coerce_bool(run_flag_value) if run_flag_value is not None else True
+    state = discovery_state.mark_started(
+        runs=runs, discovered=discovered, run_until_stopped=run_flag
+    )
     return JSONResponse(state)
 
 

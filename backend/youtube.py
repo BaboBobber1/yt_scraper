@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
@@ -278,6 +278,19 @@ class ChannelSearchResult:
 
 
 @dataclass
+class ChannelSearchSession:
+    api_key: Optional[str]
+    context: Dict[str, Any]
+
+
+@dataclass
+class ChannelSearchPage:
+    results: List[ChannelSearchResult]
+    next_page_token: Optional[str]
+    session: Optional[ChannelSearchSession] = None
+
+
+@dataclass
 class DiscoveryMetadata:
     last_upload: Optional[str] = None
     language: Optional[str] = None
@@ -410,7 +423,111 @@ def _parse_subscriber_count(text: str) -> Optional[int]:
         return None
 
 
-def search_channels(keyword: str, limit: int) -> List[ChannelSearchResult]:
+def _extract_ytcfg(html: str) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    for match in re.finditer(r"ytcfg\.set\((\{.*?\})\);", html, re.DOTALL):
+        snippet = match.group(1)
+        try:
+            payload = json.loads(snippet)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            config.update(payload)
+    return config
+
+
+def _build_channel_search_session(config: Dict[str, Any]) -> ChannelSearchSession:
+    api_key = config.get("INNERTUBE_API_KEY")
+    context_payload: Dict[str, Any]
+    context_value = config.get("INNERTUBE_CONTEXT")
+    if isinstance(context_value, dict):
+        try:
+            context_payload = json.loads(json.dumps(context_value))
+        except (TypeError, ValueError):
+            context_payload = {}
+    else:
+        context_payload = {}
+
+    if not context_payload:
+        client_version = config.get("INNERTUBE_CLIENT_VERSION") or "2.20240624.00.00"
+        client_name = config.get("INNERTUBE_CLIENT_NAME") or "WEB"
+        context_payload = {
+            "client": {
+                "clientName": client_name,
+                "clientVersion": client_version,
+                "hl": "en",
+                "gl": "US",
+            }
+        }
+
+    return ChannelSearchSession(api_key=api_key, context=context_payload)
+
+
+def _collect_channel_results(data: Dict) -> List[ChannelSearchResult]:
+    results: List[ChannelSearchResult] = []
+    if not isinstance(data, dict):
+        return results
+    for renderer in _find_channel_renderers(data):
+        channel_id = renderer.get("channelId")
+        if not channel_id:
+            continue
+        title_runs = renderer.get("title", {}).get("runs", [])
+        title = (
+            title_runs[0]["text"]
+            if title_runs
+            else renderer.get("title", {}).get("simpleText", "")
+        )
+        nav = renderer.get("navigationEndpoint", {}).get("browseEndpoint", {})
+        canonical = nav.get("canonicalBaseUrl")
+        if canonical:
+            url = f"https://www.youtube.com{canonical}"
+        else:
+            url = f"https://www.youtube.com/channel/{channel_id}"
+        sub_text_obj = renderer.get("subscriberCountText", {})
+        if "simpleText" in sub_text_obj:
+            subscribers = _parse_subscriber_count(sub_text_obj["simpleText"])
+        else:
+            runs = sub_text_obj.get("runs", [])
+            subscribers = (
+                _parse_subscriber_count(runs[0]["text"])
+                if runs
+                else None
+            )
+        results.append(
+            ChannelSearchResult(
+                channel_id=channel_id,
+                title=title,
+                url=url,
+                subscribers=subscribers,
+            )
+        )
+    return results
+
+
+def _extract_next_token(data: Dict) -> Optional[str]:
+    stack: List[Any] = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "nextContinuationData" in node:
+                next_data = node["nextContinuationData"]
+                if isinstance(next_data, dict):
+                    token = next_data.get("continuation")
+                    if token:
+                        return token
+            if "continuationCommand" in node:
+                command = node["continuationCommand"]
+                if isinstance(command, dict):
+                    token = command.get("token")
+                    if token:
+                        return token
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
+
+
+def _search_initial_page(keyword: str) -> ChannelSearchPage:
     params = {
         "search_query": keyword,
         "sp": "EgIQAg%3D%3D",  # channel filter
@@ -418,36 +535,55 @@ def search_channels(keyword: str, limit: int) -> List[ChannelSearchResult]:
     RATE_LIMITER.wait()
     response = SESSION.get("https://www.youtube.com/results", params=params, timeout=10)
     response.raise_for_status()
-    data = _extract_ytinitialdata(response.text)
-    if not data:
+    html_text = response.text
+    data = _extract_ytinitialdata(html_text)
+    config = _extract_ytcfg(html_text)
+    session = _build_channel_search_session(config)
+    results = _collect_channel_results(data or {})
+    next_token = _extract_next_token(data or {}) if data else None
+    return ChannelSearchPage(results=results, next_page_token=next_token, session=session)
+
+
+def _search_continuation_page(
+    session: ChannelSearchSession, continuation_token: str
+) -> ChannelSearchPage:
+    if not session.api_key or not session.context:
+        return ChannelSearchPage(results=[], next_page_token=None, session=session)
+
+    payload = {"context": session.context, "continuation": continuation_token}
+    params = {"key": session.api_key}
+    RATE_LIMITER.wait()
+    response = SESSION.post(
+        "https://www.youtube.com/youtubei/v1/search",
+        params=params,
+        json=payload,
+        timeout=10,
+    )
+    response.raise_for_status()
+    data = response.json()
+    results = _collect_channel_results(data if isinstance(data, dict) else {})
+    next_token = _extract_next_token(data) if isinstance(data, dict) else None
+    return ChannelSearchPage(results=results, next_page_token=next_token, session=session)
+
+
+def search_channels_page(
+    keyword: str,
+    *,
+    session: Optional[ChannelSearchSession] = None,
+    continuation_token: Optional[str] = None,
+) -> ChannelSearchPage:
+    if continuation_token and session:
+        return _search_continuation_page(session, continuation_token)
+    return _search_initial_page(keyword)
+
+
+def search_channels(keyword: str, limit: int) -> List[ChannelSearchResult]:
+    page = search_channels_page(keyword)
+    if not page.results:
         return []
-
-    results: List[ChannelSearchResult] = []
-    for renderer in _find_channel_renderers(data):
-        channel_id = renderer.get("channelId")
-        if not channel_id:
-            continue
-        title_runs = renderer.get("title", {}).get("runs", [])
-        title = title_runs[0]["text"] if title_runs else renderer.get("title", {}).get("simpleText", "")
-        nav = renderer.get("navigationEndpoint", {}).get("browseEndpoint", {})
-        canonical = nav.get("canonicalBaseUrl")
-        if canonical:
-            url = f"https://www.youtube.com{canonical}"
-        elif channel_id:
-            url = f"https://www.youtube.com/channel/{channel_id}"
-        else:
-            continue
-        sub_text_obj = renderer.get("subscriberCountText", {})
-        if "simpleText" in sub_text_obj:
-            subscribers = _parse_subscriber_count(sub_text_obj["simpleText"])
-        else:
-            runs = sub_text_obj.get("runs", [])
-            subscribers = _parse_subscriber_count(runs[0]["text"]) if runs else None
-        results.append(ChannelSearchResult(channel_id=channel_id, title=title, url=url, subscribers=subscribers))
-        if len(results) >= limit:
-            break
-
-    return results
+    if limit <= 0:
+        return []
+    return page.results[:limit]
 
 
 def fetch_discovery_metadata(channel_id: str) -> DiscoveryMetadata:

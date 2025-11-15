@@ -52,6 +52,19 @@ CHANNEL_TABLES = {
     ChannelCategory.BLACKLISTED: "channels_blacklisted",
 }
 
+
+@dataclass(frozen=True)
+class DiscoveryKeywordState:
+    """Persistent search position for a discovery keyword."""
+
+    keyword: str
+    next_page_token: Optional[str]
+    page_index: int
+    last_run_at: Optional[str]
+    exhausted: bool
+    no_new_pages: int
+    updated_at: Optional[str]
+
 PROJECT_BUNDLE_SCHEMA_VERSION = 1
 
 CHANNEL_COLUMNS = [
@@ -78,6 +91,11 @@ CHANNEL_COLUMNS = [
 ]
 
 LEGACY_TABLE = "channels"
+
+
+def _normalize_discovery_keyword(keyword: str) -> str:
+    cleaned = (keyword or "").strip()
+    return cleaned.lower()
 
 
 def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
@@ -164,6 +182,20 @@ def init_db() -> None:
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_emails_email ON channel_emails(email)"
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discovery_keyword_states (
+                keyword TEXT PRIMARY KEY,
+                next_page_token TEXT,
+                page_index INTEGER NOT NULL DEFAULT 0,
+                last_run_at TEXT,
+                exhausted INTEGER NOT NULL DEFAULT 0,
+                no_new_pages INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT
+            )
+            """
         )
 
         _migrate_legacy_channels(cursor)
@@ -292,6 +324,116 @@ def parse_email_candidates(value: Optional[str]) -> List[str]:
     return EMAIL_PATTERN.findall(value)
 
 
+def get_discovery_keyword_state(keyword: str) -> DiscoveryKeywordState:
+    """Return the persisted paging state for a discovery keyword."""
+
+    normalized = _normalize_discovery_keyword(keyword)
+    if not normalized:
+        return DiscoveryKeywordState(
+            keyword="",
+            next_page_token=None,
+            page_index=0,
+            last_run_at=None,
+            exhausted=False,
+            no_new_pages=0,
+            updated_at=None,
+        )
+
+    with get_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT keyword, next_page_token, page_index, last_run_at, exhausted, no_new_pages, updated_at
+            FROM discovery_keyword_states
+            WHERE keyword = ?
+            """,
+            (normalized,),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return DiscoveryKeywordState(
+            keyword=normalized,
+            next_page_token=None,
+            page_index=0,
+            last_run_at=None,
+            exhausted=False,
+            no_new_pages=0,
+            updated_at=None,
+        )
+
+    return DiscoveryKeywordState(
+        keyword=row["keyword"],
+        next_page_token=row["next_page_token"],
+        page_index=int(row["page_index"] or 0),
+        last_run_at=row["last_run_at"],
+        exhausted=bool(row["exhausted"]),
+        no_new_pages=int(row["no_new_pages"] or 0),
+        updated_at=row["updated_at"],
+    )
+
+
+def update_discovery_keyword_state(
+    keyword: str,
+    *,
+    next_page_token: Optional[str],
+    page_index: int,
+    last_run_at: Optional[str],
+    exhausted: bool,
+    no_new_pages: int,
+) -> DiscoveryKeywordState:
+    """Persist the paging state for a discovery keyword."""
+
+    normalized = _normalize_discovery_keyword(keyword)
+    if not normalized:
+        raise ValueError("Discovery keyword cannot be empty")
+
+    safe_page_index = max(0, int(page_index))
+    safe_no_new = max(0, int(no_new_pages))
+    timestamp = last_run_at
+
+    with get_cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO discovery_keyword_states (
+                keyword,
+                next_page_token,
+                page_index,
+                last_run_at,
+                exhausted,
+                no_new_pages,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(keyword) DO UPDATE SET
+                next_page_token = excluded.next_page_token,
+                page_index = excluded.page_index,
+                last_run_at = excluded.last_run_at,
+                exhausted = excluded.exhausted,
+                no_new_pages = excluded.no_new_pages,
+                updated_at = excluded.updated_at
+            """,
+            (
+                normalized,
+                next_page_token,
+                safe_page_index,
+                last_run_at,
+                int(bool(exhausted)),
+                safe_no_new,
+                timestamp,
+            ),
+        )
+
+    return DiscoveryKeywordState(
+        keyword=normalized,
+        next_page_token=next_page_token,
+        page_index=safe_page_index,
+        last_run_at=last_run_at,
+        exhausted=bool(exhausted),
+        no_new_pages=safe_no_new,
+        updated_at=timestamp,
+    )
+
+
 def is_blacklisted(channel_id: str) -> bool:
     with get_cursor() as cursor:
         cursor.execute(
@@ -305,6 +447,42 @@ def is_blacklisted(channel_id: str) -> bool:
             (channel_id,),
         )
         return cursor.fetchone() is not None
+
+
+def channel_exists(channel_id: str, *, include_blacklisted: bool = True) -> bool:
+    """Return True if the channel ID exists in any project table."""
+
+    normalized = (channel_id or "").strip().upper()
+    if not normalized:
+        return False
+
+    categories: List[ChannelCategory]
+    if include_blacklisted:
+        categories = list(ChannelCategory)
+    else:
+        categories = [
+            category
+            for category in ChannelCategory
+            if category != ChannelCategory.BLACKLISTED
+        ]
+
+    with get_cursor() as cursor:
+        for category in categories:
+            cursor.execute(
+                f"SELECT 1 FROM {CHANNEL_TABLES[category]} WHERE channel_id = ?",
+                (normalized,),
+            )
+            if cursor.fetchone():
+                return True
+        if include_blacklisted:
+            cursor.execute(
+                "SELECT 1 FROM blacklist WHERE channel_id = ?",
+                (normalized,),
+            )
+            if cursor.fetchone():
+                return True
+
+    return False
 
 
 def ensure_blacklisted_channel(
