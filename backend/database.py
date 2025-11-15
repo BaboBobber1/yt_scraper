@@ -1,6 +1,7 @@
 """Database utilities for the Crypto YouTube Harvester backend."""
 from __future__ import annotations
 
+import datetime as dt
 import re
 import sqlite3
 import threading
@@ -15,6 +16,12 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 _connection_lock = threading.Lock()
 _connection: Optional[sqlite3.Connection] = None
+
+
+def _utcnow_iso() -> str:
+    """Return a UTC ISO timestamp without microseconds."""
+
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat()
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -389,49 +396,161 @@ def update_discovery_keyword_state(
 
     safe_page_index = max(0, int(page_index))
     safe_no_new = max(0, int(no_new_pages))
-    timestamp = last_run_at
+    timestamp = last_run_at or _utcnow_iso()
 
     with get_cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO discovery_keyword_states (
-                keyword,
-                next_page_token,
-                page_index,
-                last_run_at,
-                exhausted,
-                no_new_pages,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(keyword) DO UPDATE SET
-                next_page_token = excluded.next_page_token,
-                page_index = excluded.page_index,
-                last_run_at = excluded.last_run_at,
-                exhausted = excluded.exhausted,
-                no_new_pages = excluded.no_new_pages,
-                updated_at = excluded.updated_at
-            """,
-            (
-                normalized,
-                next_page_token,
-                safe_page_index,
-                last_run_at,
-                int(bool(exhausted)),
-                safe_no_new,
-                timestamp,
-            ),
+        _upsert_discovery_keyword_state(
+            cursor,
+            normalized,
+            next_page_token=next_page_token,
+            page_index=safe_page_index,
+            last_run_at=timestamp,
+            exhausted=exhausted,
+            no_new_pages=safe_no_new,
+            updated_at=timestamp,
         )
 
     return DiscoveryKeywordState(
         keyword=normalized,
         next_page_token=next_page_token,
         page_index=safe_page_index,
-        last_run_at=last_run_at,
+        last_run_at=timestamp,
         exhausted=bool(exhausted),
         no_new_pages=safe_no_new,
         updated_at=timestamp,
     )
+
+
+def _cursor_is_blacklisted(cursor: sqlite3.Cursor, channel_id: str) -> bool:
+    cursor.execute(
+        f"SELECT 1 FROM {CHANNEL_TABLES[ChannelCategory.BLACKLISTED]} WHERE channel_id = ?",
+        (channel_id,),
+    )
+    if cursor.fetchone():
+        return True
+    cursor.execute("SELECT 1 FROM blacklist WHERE channel_id = ?", (channel_id,))
+    return cursor.fetchone() is not None
+
+
+def _insert_discovery_channels(
+    cursor: sqlite3.Cursor,
+    channels: Iterable[Dict[str, Any]],
+    *,
+    category: ChannelCategory = ChannelCategory.ACTIVE,
+) -> int:
+    table = CHANNEL_TABLES[category]
+    inserted = 0
+    for channel in channels:
+        channel_id = (channel.get("channel_id") or "").strip().upper()
+        if not channel_id:
+            continue
+        if category != ChannelCategory.BLACKLISTED and _cursor_is_blacklisted(cursor, channel_id):
+            continue
+        prepared = dict(channel)
+        prepared["channel_id"] = channel_id
+        payload = _prepare_channel_payload(prepared)
+        columns = ", ".join(CHANNEL_COLUMNS)
+        placeholders = ", ".join("?" for _ in CHANNEL_COLUMNS)
+        values = [payload.get(column) for column in CHANNEL_COLUMNS]
+        try:
+            cursor.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+                values,
+            )
+            inserted += 1
+        except sqlite3.IntegrityError:
+            continue
+    return inserted
+
+
+def _upsert_discovery_keyword_state(
+    cursor: sqlite3.Cursor,
+    keyword: str,
+    *,
+    next_page_token: Optional[str],
+    page_index: int,
+    last_run_at: str,
+    exhausted: bool,
+    no_new_pages: int,
+    updated_at: str,
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO discovery_keyword_states (
+            keyword,
+            next_page_token,
+            page_index,
+            last_run_at,
+            exhausted,
+            no_new_pages,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(keyword) DO UPDATE SET
+            next_page_token = excluded.next_page_token,
+            page_index = excluded.page_index,
+            last_run_at = excluded.last_run_at,
+            exhausted = excluded.exhausted,
+            no_new_pages = excluded.no_new_pages,
+            updated_at = excluded.updated_at
+        """,
+        (
+            keyword,
+            next_page_token,
+            page_index,
+            last_run_at,
+            int(bool(exhausted)),
+            no_new_pages,
+            updated_at,
+        ),
+    )
+
+
+def persist_discovery_batch(
+    keyword: str,
+    *,
+    new_channels: Iterable[Dict[str, Any]],
+    next_page_token: Optional[str],
+    page_index: int,
+    last_run_at: Optional[str] = None,
+    exhausted: bool,
+    no_new_pages: int,
+) -> Tuple[DiscoveryKeywordState, int]:
+    """Atomically store discovery paging metadata and newly found channels."""
+
+    normalized = _normalize_discovery_keyword(keyword)
+    if not normalized:
+        raise ValueError("Discovery keyword cannot be empty")
+
+    safe_page_index = max(0, int(page_index))
+    safe_no_new = max(0, int(no_new_pages))
+    timestamp = last_run_at or _utcnow_iso()
+
+    channels_list = list(new_channels or [])
+
+    with get_cursor() as cursor:
+        inserted = _insert_discovery_channels(cursor, channels_list)
+        _upsert_discovery_keyword_state(
+            cursor,
+            normalized,
+            next_page_token=next_page_token,
+            page_index=safe_page_index,
+            last_run_at=timestamp,
+            exhausted=exhausted,
+            no_new_pages=safe_no_new,
+            updated_at=timestamp,
+        )
+
+    state = DiscoveryKeywordState(
+        keyword=normalized,
+        next_page_token=next_page_token,
+        page_index=safe_page_index,
+        last_run_at=timestamp,
+        exhausted=bool(exhausted),
+        no_new_pages=safe_no_new,
+        updated_at=timestamp,
+    )
+    return state, inserted
 
 
 def is_blacklisted(channel_id: str) -> bool:

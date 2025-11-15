@@ -1516,10 +1516,66 @@ class Dashboard {
         requestOptions.lastUploadMaxAgeDays = inputs.lastUploadMaxAgeDays;
       }
       const response = await discoverChannels(inputs.keywords, inputs.perKeyword, requestOptions);
-      let message = `Discovered ${response.found} new channels.`;
+      const session = response.session || null;
+      const newCount = Number(response?.found ?? 0);
+      const newLabel = newCount === 1 ? 'new channel' : 'new channels';
+      const describeExhaustion = () => {
+        if (!session?.exhausted) {
+          return 'Exhausted: no.';
+        }
+        const reason = session.exhaustionReason || '';
+        if (reason === 'no_new_channels') {
+          const threshold = Number(session.noNewThreshold ?? session.consecutiveNoNew ?? 0);
+          if (threshold > 0) {
+            return `Exhausted — no new channels on ${formatNumber(threshold)} consecutive pages.`;
+          }
+          return 'Exhausted — no new channels across recent pages.';
+        }
+        if (reason === 'no_more_pages') {
+          return 'Exhausted — no additional pages available.';
+        }
+        if (reason === 'session_unavailable') {
+          return 'Exhausted — session context expired.';
+        }
+        if (reason === 'persisted') {
+          return 'Exhausted — keyword already marked as exhausted from previous runs.';
+        }
+        return 'Exhausted — keyword marked as complete.';
+      };
+
+      let message;
+      if (session) {
+        const keywordLabel = session.keyword ? `Keyword “${session.keyword}”` : 'Discovery';
+        const lastPageIndex = Number(session.lastPageIndex ?? session.nextPageIndex ?? 0);
+        const pagesProcessed = Number(session.pagesProcessed ?? 0);
+        const pageDetails = [];
+        if (lastPageIndex > 0) {
+          pageDetails.push(`current page ${formatNumber(lastPageIndex)}`);
+        }
+        if (pagesProcessed > 0) {
+          const batchLabel = pagesProcessed === 1 ? 'batch' : 'batches';
+          pageDetails.push(`processed ${formatNumber(pagesProcessed)} ${batchLabel} this run`);
+        }
+        if (pageDetails.length === 0) {
+          pageDetails.push('no pages processed');
+        }
+        message = `${keywordLabel} — ${pageDetails.join(', ')}. Found ${formatNumber(newCount)} ${newLabel}.`;
+        const lastBatchNew = Number(session.lastPageNewChannels ?? -1);
+        if (!Number.isNaN(lastBatchNew) && lastBatchNew >= 0 && pagesProcessed > 0) {
+          const lastLabel = lastBatchNew === 1 ? 'channel' : 'channels';
+          message += ` Last batch: ${formatNumber(lastBatchNew)} ${lastLabel}.`;
+        }
+        message += ` ${describeExhaustion()}`;
+      } else {
+        message = `Discovered ${formatNumber(newCount)} ${newLabel}.`;
+      }
       if (response.blacklisted) {
         const suffix = response.blacklisted === 1 ? 'candidate' : 'candidates';
-        message += ` Blacklisted ${response.blacklisted} ${suffix}.`;
+        message += ` Blacklisted ${formatNumber(response.blacklisted)} ${suffix}.`;
+      }
+      if (response.known) {
+        const suffix = response.known === 1 ? 'channel' : 'channels';
+        message += ` Skipped ${formatNumber(response.known)} known ${suffix}.`;
       }
       if (!deferStatusUpdate) {
         this.updateStatusBar(`${prefix}${message}`, 'success');
