@@ -371,22 +371,29 @@ class EnrichmentManager:
         except EnrichmentError as exc:
             error_time = dt.datetime.utcnow().isoformat()
             reason = str(exc)
+            status = "error"
+            completed_flag = False
+            result_value = "error"
+            if reason == "invalid_channel":
+                status = "invalid_channel"
+                completed_flag = True
+                result_value = "invalid_channel"
             database.update_channel_enrichment(
                 channel_id,
-                needs_enrichment=True,
+                needs_enrichment=False if status != "error" else True,
                 last_error=reason,
-                status="error",
+                status=status,
                 status_reason=reason,
                 last_status_change=error_time,
                 last_enriched_at=error_time,
-                last_enriched_result="error",
+                last_enriched_result=result_value,
             )
-            job.update_counts(completed=False)
+            job.update_counts(completed=completed_flag)
             job.push_update(
                 {
                     "type": "channel",
                     "channelId": channel_id,
-                    "status": "error",
+                    "status": status,
                     "statusReason": reason,
                     "lastStatusChange": error_time,
                     "mode": job.mode,
@@ -429,7 +436,11 @@ class EnrichmentManager:
             database.record_channel_emails(channel_id, enriched_emails, success_time)
         emails = ", ".join(enriched_emails) if enriched_emails else None
         email_gate_present = enriched.get("email_gate_present")
-        result_value = "emails_found" if enriched_emails else "no_emails"
+        status = enriched.get("status") or "completed"
+        status_reason = enriched.get("status_reason") if status != "completed" else None
+        result_value = "emails_found" if enriched_emails else (
+            status if status != "completed" else "no_emails"
+        )
         database.update_channel_enrichment(
             channel_id,
             name=enriched.get("name") or enriched.get("title") or channel.get("name") or channel.get("title"),
@@ -443,19 +454,19 @@ class EnrichmentManager:
             last_enriched_at=success_time,
             last_enriched_result=result_value,
             needs_enrichment=False,
-            last_error=None,
-            status="completed",
-            status_reason=None,
+            last_error=status_reason if status != "completed" else None,
+            status=status,
+            status_reason=status_reason,
             last_status_change=success_time,
         )
 
-        job.update_counts(completed=True)
+        job.update_counts(completed=status not in {"error", "failed"})
         job.push_update(
             {
                 "type": "channel",
                 "channelId": channel_id,
-                "status": "completed",
-                "statusReason": None,
+                "status": status,
+                "statusReason": status_reason,
                 "lastStatusChange": success_time,
                 "subscribers": enriched.get("subscribers"),
                 "language": enriched.get("language"),
