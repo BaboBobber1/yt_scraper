@@ -16,15 +16,33 @@ from .youtube import EnrichmentError, enrich_channel, enrich_channel_email_only
 
 
 NO_EMAIL_RETRY_WINDOW = dt.timedelta(days=30)
+RECENT_NO_EMAIL_STATUS = database.RECENT_NO_EMAIL_STATUS
+RECENT_NO_EMAIL_REASON = "Skipped due to recent no-email result"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[dt.datetime]:
     if not value:
         return None
+    candidate = value.strip() if isinstance(value, str) else value
+    if not candidate:
+        return None
+    if isinstance(candidate, str) and candidate.endswith("Z"):
+        candidate = f"{candidate[:-1]}+00:00"
     try:
-        return dt.datetime.fromisoformat(value)
+        parsed = dt.datetime.fromisoformat(candidate)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.utcnow().replace(microsecond=0)
+
+
+def _format_timestamp(value: dt.datetime) -> str:
+    return value.replace(microsecond=0).isoformat()
 
 
 @dataclass
@@ -101,15 +119,21 @@ class EnrichmentManager:
             raise ValueError(f"Unsupported enrichment mode: {mode}")
         if mode == "email_only":
             channels = database.get_channels_for_email_enrichment(limit)
+            filtered = list(channels)
+            skipped: List[Dict] = []
+            requested = len(channels)
         else:
-            channels = database.get_pending_channels(limit)
-        filtered, skipped = self._filter_channels(channels, force_run=force_run, never_reenrich=never_reenrich)
+            filtered, skipped, requested = self._collect_pending_channels(
+                limit,
+                force_run=force_run,
+                never_reenrich=never_reenrich,
+            )
         job_id = str(uuid.uuid4())
         job = EnrichmentJob(
             job_id=job_id,
             channels=filtered,
             mode=mode,
-            requested=len(channels),
+            requested=requested,
             skipped=len(skipped),
         )
         with self._lock:
@@ -126,6 +150,70 @@ class EnrichmentManager:
         job.push_update({"type": "progress", **job.summary()})
         return job
 
+    def _collect_pending_channels(
+        self,
+        limit: Optional[int],
+        *,
+        force_run: bool,
+        never_reenrich: bool,
+    ) -> Tuple[List[Dict], List[Dict], int]:
+        if force_run:
+            channels = database.get_pending_channels(limit)
+            return list(channels), [], len(channels)
+
+        filtered: List[Dict] = []
+        skipped: List[Dict] = []
+        requested = 0
+        seen_ids: set[str] = set()
+        default_chunk = limit or 100
+        if default_chunk <= 0:
+            default_chunk = 100
+
+        iterations = 0
+        while True:
+            needed = default_chunk if limit is None else max(0, limit - len(filtered))
+            if needed <= 0:
+                break
+            fetch_size = needed + len(seen_ids)
+            chunk = database.get_pending_channels(fetch_size)
+            if not chunk:
+                break
+            unique_chunk: List[Dict] = []
+            for channel in chunk:
+                channel_id = channel.get("channel_id")
+                if channel_id and channel_id in seen_ids:
+                    continue
+                if channel_id:
+                    seen_ids.add(channel_id)
+                unique_chunk.append(channel)
+                if len(unique_chunk) >= needed:
+                    break
+
+            if not unique_chunk:
+                break
+
+            requested += len(unique_chunk)
+            filtered_chunk, skipped_chunk = self._filter_channels(
+                unique_chunk,
+                force_run=False,
+                never_reenrich=never_reenrich,
+            )
+            filtered.extend(filtered_chunk)
+            skipped.extend(skipped_chunk)
+
+            if limit is not None and len(filtered) >= limit:
+                filtered = filtered[:limit]
+                break
+
+            if len(unique_chunk) < needed and len(chunk) < fetch_size:
+                break
+
+            iterations += 1
+            if iterations >= 20:
+                break
+
+        return filtered, skipped, requested
+
     def _filter_channels(
         self,
         channels: List[Dict],
@@ -138,22 +226,78 @@ class EnrichmentManager:
 
         filtered: List[Dict] = []
         skipped: List[Dict] = []
-        now = dt.datetime.utcnow()
+        now = _utcnow()
+        now_iso = _format_timestamp(now)
+        cooldown = NO_EMAIL_RETRY_WINDOW
         for channel in channels:
-            should_skip = False
+            channel_id = channel.get("channel_id")
+            if not channel_id:
+                filtered.append(channel)
+                continue
+
             last_enriched_at = _parse_iso_datetime(channel.get("last_enriched_at"))
+            last_result = str(channel.get("last_enriched_result") or "").strip().lower()
+            has_emails = bool(str(channel.get("emails") or "").strip())
+            status = str(channel.get("status") or "").strip().lower()
+
+            should_skip = False
+            skip_reason: Optional[str] = None
+
             if never_reenrich and last_enriched_at:
                 should_skip = True
-            else:
-                last_result = str(channel.get("last_enriched_result") or "").lower()
-                if last_result == "no_emails" and last_enriched_at:
-                    if now - last_enriched_at < NO_EMAIL_RETRY_WINDOW:
-                        should_skip = True
+                skip_reason = "never_reenrich"
+            elif (
+                last_enriched_at
+                and last_result == "no_emails"
+                and not has_emails
+                and now - last_enriched_at < cooldown
+            ):
+                should_skip = True
+                skip_reason = "recent_no_email"
+
             if should_skip:
-                skipped.append(channel)
-            else:
-                filtered.append(channel)
+                skipped_info = dict(channel)
+                if skip_reason:
+                    skipped_info["skip_reason"] = skip_reason
+                if skip_reason == "recent_no_email":
+                    self._mark_recent_no_email_skip(channel_id, now_iso)
+                skipped.append(skipped_info)
+                if skip_reason == "recent_no_email":
+                    continue
+                # For other skip reasons (e.g., never re-enrich) we still
+                # exclude the channel from this batch without additional
+                # status changes.
+                continue
+
+            if status == RECENT_NO_EMAIL_STATUS and not should_skip:
+                if (
+                    last_result != "no_emails"
+                    or has_emails
+                    or not last_enriched_at
+                    or now - last_enriched_at >= cooldown
+                ):
+                    self._clear_recent_no_email_skip(channel_id, now_iso)
+
+            filtered.append(channel)
+
         return filtered, skipped
+
+    def _mark_recent_no_email_skip(self, channel_id: str, timestamp: str) -> None:
+        database.update_channel_enrichment(
+            channel_id,
+            status=RECENT_NO_EMAIL_STATUS,
+            status_reason=RECENT_NO_EMAIL_REASON,
+            last_status_change=timestamp,
+            last_attempted=timestamp,
+        )
+
+    def _clear_recent_no_email_skip(self, channel_id: str, timestamp: str) -> None:
+        database.update_channel_enrichment(
+            channel_id,
+            status="new",
+            status_reason=None,
+            last_status_change=timestamp,
+        )
 
     def stream(self, job_id: str):
         job = self._jobs.get(job_id)
