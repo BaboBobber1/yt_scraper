@@ -20,6 +20,7 @@ from .database import (
     channel_exists,
     ensure_channel_url,
     get_discovery_keyword_state,
+    persist_discovery_batch,
     update_discovery_keyword_state,
 )
 from .enrichment import manager
@@ -60,7 +61,7 @@ DEFAULT_KEYWORDS = [
 
 RUN_UNTIL_STOPPED_MAX_PAGES_PER_RUN = 20
 RUN_UNTIL_STOPPED_MAX_NEW_CHANNELS = 200
-RUN_UNTIL_STOPPED_NO_NEW_THRESHOLD = 4
+RUN_UNTIL_STOPPED_NO_NEW_THRESHOLD = 5
 
 
 def _parse_multi(values: Optional[List[str]]) -> Optional[List[str]]:
@@ -409,14 +410,17 @@ def _run_until_stopped_discovery(
     page_index = max(0, int(state.page_index))
     next_token = state.next_page_token
     consecutive_no_new = max(0, int(state.no_new_pages))
-    exhausted_flag = False
+    exhausted_flag = bool(state.exhausted)
+    exhaustion_reason: Optional[str] = "persisted" if exhausted_flag else None
     stop_requested = False
 
     seen_ids: Set[str] = set()
-    new_channels: List[Dict[str, Any]] = []
     total_known = 0
     total_blacklisted = 0
+    total_inserted = 0
     pages_processed = 0
+    last_page_new = 0
+    last_page_index = page_index
 
     target_new_limit = max(1, int(per_keyword))
     target_new_limit = min(target_new_limit, RUN_UNTIL_STOPPED_MAX_NEW_CHANNELS)
@@ -425,60 +429,146 @@ def _run_until_stopped_discovery(
 
     current_token = next_token
     session = None
-    last_run_timestamp: Optional[str] = None
+    last_run_timestamp: Optional[str] = state.last_run_at
+    starting_page_index = page_index
+    resumed_from_state = page_index > 0 or bool(next_token)
 
-    if page_index > 0 and not current_token:
+    discovery_state.update_session(
+        keyword=keyword,
+        new=0,
+        known=0,
+        pages=page_index,
+        exhausted=exhausted_flag,
+        run_until_stopped=True,
+    )
+
+    if page_index > 0 and not current_token and not exhausted_flag:
         exhausted_flag = True
-    else:
-        try:
-            initial_page = search_channels_page(keyword)
-        except Exception as exc:  # pragma: no cover - network errors
-            raise HTTPException(
-                status_code=502,
-                detail=f"Failed to search for keyword '{keyword}': {exc}",
-            ) from exc
-        session = initial_page.session
-        if page_index == 0:
-            new_in_page, known_in_page, blacklisted_in_page = _process_search_results(
-                initial_page.results,
-                context=context,
-                seen_ids=seen_ids,
-                new_channels=new_channels,
-            )
-            total_known += known_in_page
-            total_blacklisted += blacklisted_in_page
-            pages_processed += 1
-            if new_in_page == 0:
-                consecutive_no_new += 1
-            else:
-                consecutive_no_new = 0
-            page_index += 1
-            current_token = initial_page.next_page_token
-            if current_token is None:
-                exhausted_flag = True
-            timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
-            update_discovery_keyword_state(
-                keyword,
-                next_page_token=current_token,
-                page_index=page_index,
-                last_run_at=timestamp,
-                exhausted=exhausted_flag,
-                no_new_pages=consecutive_no_new,
-            )
-            last_run_timestamp = timestamp
+        exhaustion_reason = "no_more_pages"
+
+    if exhausted_flag:
+        timestamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+        updated_state = update_discovery_keyword_state(
+            keyword,
+            next_page_token=current_token,
+            page_index=page_index,
+            last_run_at=timestamp,
+            exhausted=True,
+            no_new_pages=consecutive_no_new,
+        )
+        last_run_timestamp = updated_state.last_run_at
+        discovery_state.update_session(
+            keyword=keyword,
+            new=0,
+            known=0,
+            pages=page_index,
+            exhausted=True,
+            run_until_stopped=True,
+        )
+        totals = database.get_channel_totals()
+        session_info = {
+            "keyword": keyword,
+            "newChannels": 0,
+            "knownChannels": 0,
+            "blacklistedChannels": 0,
+            "pagesProcessed": 0,
+            "startingPageIndex": starting_page_index,
+            "lastPageIndex": page_index,
+            "nextPageIndex": page_index,
+            "nextPageToken": current_token,
+            "lastPageNewChannels": 0,
+            "consecutiveNoNew": consecutive_no_new,
+            "noNewThreshold": no_new_threshold,
+            "exhausted": True,
+            "exhaustionReason": exhaustion_reason,
+            "stopRequested": False,
+            "resumedFromState": resumed_from_state,
+            "lastRunAt": last_run_timestamp,
+        }
+        response_payload: Dict[str, Any] = {
+            "found": 0,
+            "uniqueTotal": totals["total"],
+            "session": session_info,
+        }
+        return response_payload, session_info
+
+    try:
+        initial_page = search_channels_page(keyword)
+    except Exception as exc:  # pragma: no cover - network errors
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to search for keyword '{keyword}': {exc}",
+        ) from exc
+
+    session = initial_page.session
+    if page_index == 0:
+        batch_new_channels: List[Dict[str, Any]] = []
+        new_in_page, known_in_page, blacklisted_in_page = _process_search_results(
+            initial_page.results,
+            context=context,
+            seen_ids=seen_ids,
+            new_channels=batch_new_channels,
+        )
+        total_known += known_in_page
+        total_blacklisted += blacklisted_in_page
+        pages_processed += 1
+        if new_in_page == 0:
+            consecutive_no_new += 1
         else:
-            current_token = next_token
+            consecutive_no_new = 0
+        page_index += 1
+        current_token = initial_page.next_page_token
+        if session is None:
+            current_token = None
+            exhausted_flag = True
+            exhaustion_reason = exhaustion_reason or "session_unavailable"
+        if current_token is None:
+            exhausted_flag = True
+            exhaustion_reason = exhaustion_reason or "no_more_pages"
+        if consecutive_no_new >= no_new_threshold:
+            exhausted_flag = True
+            exhaustion_reason = exhaustion_reason or "no_new_channels"
+        timestamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+        state_result, inserted = persist_discovery_batch(
+            keyword,
+            new_channels=batch_new_channels,
+            next_page_token=current_token,
+            page_index=page_index,
+            last_run_at=timestamp,
+            exhausted=exhausted_flag,
+            no_new_pages=consecutive_no_new,
+        )
+        total_inserted += inserted
+        last_page_new = inserted
+        last_page_index = page_index
+        current_token = state_result.next_page_token
+        last_run_timestamp = state_result.last_run_at
+        discovery_state.update_session(
+            keyword=keyword,
+            new=total_inserted,
+            known=total_known,
+            pages=last_page_index,
+            exhausted=exhausted_flag,
+            run_until_stopped=True,
+        )
+    else:
+        current_token = next_token
+        if session is None:
+            current_token = None
+            exhausted_flag = True
+            exhaustion_reason = exhaustion_reason or "session_unavailable"
+
+    if not exhausted_flag and discovery_state.is_stop_requested():
+        stop_requested = True
 
     while (
         not exhausted_flag
         and not stop_requested
+        and session is not None
         and current_token
         and pages_processed < max_pages
-        and len(new_channels) < target_new_limit
+        and total_inserted < target_new_limit
     ):
-        if session is None:
-            exhausted_flag = True
-            break
         try:
             page = search_channels_page(
                 keyword, session=session, continuation_token=current_token
@@ -489,11 +579,12 @@ def _run_until_stopped_discovery(
                 detail=f"Failed to continue search for keyword '{keyword}': {exc}",
             ) from exc
 
+        batch_new_channels = []
         new_in_page, known_in_page, blacklisted_in_page = _process_search_results(
             page.results,
             context=context,
             seen_ids=seen_ids,
-            new_channels=new_channels,
+            new_channels=batch_new_channels,
         )
         total_known += known_in_page
         total_blacklisted += blacklisted_in_page
@@ -505,24 +596,40 @@ def _run_until_stopped_discovery(
 
         page_index += 1
         current_token = page.next_page_token
+        if session is None:
+            current_token = None
         if current_token is None:
             exhausted_flag = True
-
+            exhaustion_reason = exhaustion_reason or "no_more_pages"
         if consecutive_no_new >= no_new_threshold:
             exhausted_flag = True
+            exhaustion_reason = exhaustion_reason or "no_new_channels"
 
-        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
-        update_discovery_keyword_state(
+        timestamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+        state_result, inserted = persist_discovery_batch(
             keyword,
+            new_channels=batch_new_channels,
             next_page_token=current_token,
             page_index=page_index,
             last_run_at=timestamp,
             exhausted=exhausted_flag,
             no_new_pages=consecutive_no_new,
         )
-        last_run_timestamp = timestamp
+        total_inserted += inserted
+        last_page_new = inserted
+        last_page_index = page_index
+        current_token = state_result.next_page_token
+        last_run_timestamp = state_result.last_run_at
+        discovery_state.update_session(
+            keyword=keyword,
+            new=total_inserted,
+            known=total_known,
+            pages=last_page_index,
+            exhausted=exhausted_flag,
+            run_until_stopped=True,
+        )
 
-        if len(new_channels) >= target_new_limit:
+        if total_inserted >= target_new_limit:
             break
         if pages_processed >= max_pages:
             break
@@ -532,9 +639,9 @@ def _run_until_stopped_discovery(
             stop_requested = True
             break
 
-    if last_run_timestamp is None:
-        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
-        update_discovery_keyword_state(
+    if last_run_timestamp is None or exhausted_flag or stop_requested:
+        timestamp = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+        state_result = update_discovery_keyword_state(
             keyword,
             next_page_token=current_token,
             page_index=page_index,
@@ -542,24 +649,23 @@ def _run_until_stopped_discovery(
             exhausted=exhausted_flag,
             no_new_pages=consecutive_no_new,
         )
-        last_run_timestamp = timestamp
-    elif exhausted_flag or stop_requested:
-        timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
-        update_discovery_keyword_state(
-            keyword,
-            next_page_token=current_token,
-            page_index=page_index,
-            last_run_at=timestamp,
-            exhausted=exhausted_flag,
-            no_new_pages=consecutive_no_new,
-        )
-        last_run_timestamp = timestamp
+        last_run_timestamp = state_result.last_run_at
+        current_token = state_result.next_page_token
+        last_page_index = max(last_page_index, state_result.page_index)
 
-    inserted = database.bulk_insert_channels(new_channels)
+    discovery_state.update_session(
+        keyword=keyword,
+        new=total_inserted,
+        known=total_known,
+        pages=page_index,
+        exhausted=exhausted_flag,
+        run_until_stopped=True,
+    )
+
     totals = database.get_channel_totals()
 
     response_payload: Dict[str, Any] = {
-        "found": inserted,
+        "found": total_inserted,
         "uniqueTotal": totals["total"],
     }
     if total_blacklisted:
@@ -569,14 +675,25 @@ def _run_until_stopped_discovery(
 
     session_info = {
         "keyword": keyword,
-        "newChannels": inserted,
+        "newChannels": total_inserted,
         "knownChannels": total_known,
+        "blacklistedChannels": total_blacklisted,
         "pagesProcessed": pages_processed,
+        "startingPageIndex": starting_page_index,
+        "lastPageIndex": last_page_index,
         "nextPageIndex": page_index,
+        "nextPageToken": current_token,
+        "lastPageNewChannels": last_page_new,
+        "consecutiveNoNew": consecutive_no_new,
+        "noNewThreshold": no_new_threshold,
         "exhausted": exhausted_flag,
+        "exhaustionReason": exhaustion_reason,
         "stopRequested": stop_requested,
+        "resumedFromState": resumed_from_state,
+        "lastRunAt": last_run_timestamp,
     }
 
+    response_payload["session"] = session_info
     return response_payload, session_info
 
 @app.get("/")
@@ -639,7 +756,7 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
             keyword=keyword,
             new=session_info.get("newChannels"),
             known=session_info.get("knownChannels"),
-            pages=session_info.get("nextPageIndex"),
+            pages=session_info.get("lastPageIndex") or session_info.get("nextPageIndex"),
             exhausted=session_info.get("exhausted"),
             run_until_stopped=True,
         )
