@@ -9,6 +9,10 @@ import {
   fetchChannels,
   fetchStats,
   importBlacklist,
+  notifyDiscoveryLoopComplete,
+  notifyDiscoveryLoopProgress,
+  notifyDiscoveryLoopStart,
+  notifyDiscoveryLoopStop,
   restoreByFilter,
   restoreChannels,
   startEnrichment,
@@ -110,6 +114,17 @@ function formatDate(value) {
   return date.toLocaleDateString();
 }
 
+function formatDateTime(value) {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date.toLocaleString();
+}
+
 function parseList(value) {
   if (!value) {
     return [];
@@ -195,6 +210,12 @@ class Dashboard {
     this.activeDropdownToggle = null;
     this.handleDocumentClick = this.handleDocumentClick.bind(this);
     this.handleDocumentKeydown = this.handleDocumentKeydown.bind(this);
+    this.statsPromise = null;
+    this.statsPollTimer = null;
+    this.lastLoopCompletionVersion = null;
+    this.discoveryLoopCompletionPayload = null;
+    this.finalizingDiscoveryLoop = false;
+    this.discoveryLoopCompletionSent = false;
   }
 
   init() {
@@ -209,8 +230,10 @@ class Dashboard {
     this.updateDiscoverySummary();
     this.updateQuickStats();
     this.updateStatusBar('', 'info');
+    this.updateSystemStatus(null);
     this.loadStats();
     this.loadTable(this.activeTab);
+    this.startStatsPolling();
   }
 
   cacheElements() {
@@ -235,6 +258,7 @@ class Dashboard {
       statusBar: this.root.querySelector('#statusBar'),
       progressBar: this.root.querySelector('#progressBar'),
       summaryBar: this.root.querySelector('#summaryBar'),
+      systemStatusBar: this.root.querySelector('#systemStatusBar'),
       discoverKeywords: document.getElementById('discoverKeywords'),
       discoverPerKeyword: document.getElementById('discoverPerKeyword'),
       discoverDenyLanguages: document.getElementById('discoverDenyLanguages'),
@@ -785,6 +809,161 @@ class Dashboard {
     });
   }
 
+  startStatsPolling() {
+    if (this.statsPollTimer) {
+      return;
+    }
+    this.statsPollTimer = setInterval(() => {
+      this.loadStats();
+    }, 5000);
+  }
+
+  renderSystemStatusItem(indicatorClass, text, options = {}) {
+    if (!text) {
+      return '';
+    }
+    const classes = ['system-status__item'];
+    if (options.muted) {
+      classes.push('system-status__item--muted');
+    }
+    const indicator = indicatorClass || 'system-status__indicator--idle';
+    return `
+      <span class="${classes.join(' ')}">
+        <span class="system-status__indicator ${indicator}"></span>
+        <span>${escapeHtml(text)}</span>
+      </span>
+    `;
+  }
+
+  updateSystemStatus(stats, options = {}) {
+    if (!this.el.systemStatusBar) {
+      return;
+    }
+    if (!stats) {
+      this.el.systemStatusBar.innerHTML = this.renderSystemStatusItem(
+        'system-status__indicator--idle',
+        options.unavailable ? 'System status unavailable' : 'Collecting system status…',
+        { muted: true }
+      );
+      return;
+    }
+    const loop = stats.discoveryLoop || {};
+    const statusTotals = stats.statusTotals || {};
+    const enrichment = stats.enrichment || {};
+    const parseCount = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const truncate = (value, max = 120) => {
+      if (!value) {
+        return '';
+      }
+      const text = String(value);
+      return text.length > max ? `${text.slice(0, max)}…` : text;
+    };
+    const items = [];
+
+    const loopRuns = parseCount(loop.runs);
+    const loopFound = parseCount(loop.discovered);
+    if (loop.running) {
+      const indicator = loop.stop_requested
+        ? 'system-status__indicator--pending'
+        : 'system-status__indicator--running';
+      let text = `Discovery loop: Running (${formatNumber(loopRuns)} runs, ${formatNumber(loopFound)} new)`;
+      if (loop.stop_requested) {
+        text += ' — stop after current run';
+      }
+      items.push(this.renderSystemStatusItem(indicator, text));
+    } else {
+      let indicator = 'system-status__indicator--idle';
+      let text = 'Discovery loop: Idle';
+      const lastCompletedAt = formatDateTime(loop.last_completed_at);
+      if (loop.last_reason === 'error') {
+        indicator = 'system-status__indicator--error';
+        text = `Discovery loop error after ${formatNumber(loopRuns)} runs`;
+        if (loop.last_error) {
+          text += ` — ${truncate(loop.last_error, 80)}`;
+        }
+      } else if (loop.last_reason === 'stopped' || loop.last_reason === 'completed') {
+        const reasonLabel = loop.last_reason === 'stopped' ? 'stopped' : 'completed';
+        text = `Discovery loop ${reasonLabel}: ${formatNumber(loopRuns)} runs, ${formatNumber(loopFound)} new`;
+        if (lastCompletedAt) {
+          text += ` (${lastCompletedAt})`;
+        }
+      } else if (lastCompletedAt) {
+        text = `Discovery loop idle since ${lastCompletedAt}`;
+      }
+      items.push(this.renderSystemStatusItem(indicator, text));
+    }
+
+    const processingCount = parseCount(statusTotals.processing);
+    const processingIndicator = processingCount > 0
+      ? 'system-status__indicator--pending'
+      : 'system-status__indicator--idle';
+    const processingText = `Channels processing: ${formatNumber(processingCount)}`;
+    items.push(this.renderSystemStatusItem(processingIndicator, processingText));
+
+    const activeJobs = parseCount(enrichment.activeJobs);
+    const pendingChannels = parseCount(enrichment.pendingChannels);
+    let enrichmentIndicator = 'system-status__indicator--idle';
+    let enrichmentText = 'Enrichment: Idle';
+    if (activeJobs > 0) {
+      enrichmentIndicator = 'system-status__indicator--running';
+      const jobLabel = activeJobs === 1 ? 'job' : 'jobs';
+      enrichmentText = `Enrichment: ${formatNumber(activeJobs)} ${jobLabel} active`;
+      if (pendingChannels > 0) {
+        enrichmentText += ` (${formatNumber(pendingChannels)} pending)`;
+      }
+    } else if (pendingChannels > 0 || parseCount(enrichment.processingChannels) > 0) {
+      enrichmentIndicator = 'system-status__indicator--pending';
+      const pendingTotal = pendingChannels || parseCount(enrichment.processingChannels);
+      enrichmentText = `Enrichment: Finalizing ${formatNumber(pendingTotal)} channels`;
+    }
+    items.push(this.renderSystemStatusItem(enrichmentIndicator, enrichmentText));
+
+    this.el.systemStatusBar.innerHTML = items.join('');
+  }
+
+  async maybeRefreshAfterLoop(stats) {
+    if (!stats) {
+      return;
+    }
+    const loop = stats.discoveryLoop || {};
+    const statusTotals = stats.statusTotals || {};
+    const enrichment = stats.enrichment || {};
+    const processingCount = Number(statusTotals.processing ?? 0) || 0;
+    const activeJobs = Number(enrichment.activeJobs ?? 0) || 0;
+    if (loop.running) {
+      return;
+    }
+    if (!loop.last_completed_at) {
+      return;
+    }
+    if (processingCount > 0 || activeJobs > 0) {
+      return;
+    }
+    const version = typeof loop.version === 'number' ? loop.version : null;
+    if (version != null && version === this.lastLoopCompletionVersion) {
+      return;
+    }
+    this.lastLoopCompletionVersion = version != null ? version : Date.now();
+    await this.loadTable(Category.ACTIVE, (state) => ({ ...state, loading: true }));
+    if (this.activeTab !== Category.ACTIVE) {
+      await this.loadTable(this.activeTab, (state) => ({ ...state, loading: true }));
+    }
+    let message = 'Discovery loop finished. Data refreshed.';
+    let tone = 'success';
+    if (loop.last_reason === 'stopped') {
+      message = 'Discovery loop stopped. Data refreshed.';
+    } else if (loop.last_reason === 'completed') {
+      message = 'Discovery loop completed. Data refreshed.';
+    } else if (loop.last_reason === 'error') {
+      message = 'Discovery loop ended with errors. Data refreshed.';
+      tone = 'error';
+    }
+    this.updateStatusBar(message, tone);
+  }
+
   updateStatusBar(message, tone = 'info') {
     if (!this.el.statusBar) {
       return;
@@ -833,14 +1012,27 @@ class Dashboard {
   }
 
   async loadStats() {
-    try {
-      const stats = await fetchStats();
-      this.stats = stats;
-      this.updateQuickStats();
-    } catch (error) {
-      console.error('Failed to load stats', error);
-      this.updateStatusBar('Failed to load statistics.', 'error');
+    if (this.statsPromise) {
+      return this.statsPromise;
     }
+    this.statsPromise = (async () => {
+      try {
+        const stats = await fetchStats();
+        this.stats = stats;
+        this.updateQuickStats();
+        this.updateSystemStatus(stats);
+        await this.maybeRefreshAfterLoop(stats);
+        return stats;
+      } catch (error) {
+        console.error('Failed to load stats', error);
+        this.updateStatusBar('Failed to load statistics.', 'error');
+        this.updateSystemStatus(null, { unavailable: true });
+        return null;
+      } finally {
+        this.statsPromise = null;
+      }
+    })();
+    return this.statsPromise;
   }
 
   async loadTable(category, mutate) {
@@ -1449,6 +1641,136 @@ class Dashboard {
     await this.triggerAutoEnrich(queued);
   }
 
+  async reportDiscoveryLoopProgress() {
+    try {
+      await notifyDiscoveryLoopProgress({
+        runs: this.discoveryLoopStats.runs,
+        discovered: this.discoveryLoopStats.found,
+      });
+    } catch (error) {
+      console.warn('Failed to sync discovery loop progress', error);
+    }
+  }
+
+  queueDiscoveryLoopCompletion(payload) {
+    this.discoveryLoopCompletionPayload = {
+      runs: Number(payload.runs ?? 0) || 0,
+      discovered: Number(payload.discovered ?? 0) || 0,
+      reason: payload.reason || null,
+      error: Boolean(payload.error),
+      message: payload.message ? String(payload.message) : undefined,
+    };
+    this.discoveryLoopCompletionSent = false;
+    this.tryFinalizeDiscoveryLoop();
+  }
+
+  async tryFinalizeDiscoveryLoop() {
+    if (!this.discoveryLoopCompletionPayload) {
+      return;
+    }
+    if (this.discoveryLoopActive || this.enrichmentBusy || this.pendingAutoEnrich > 0) {
+      return;
+    }
+    if (this.finalizingDiscoveryLoop) {
+      return;
+    }
+    const payload = { ...this.discoveryLoopCompletionPayload };
+    this.finalizingDiscoveryLoop = true;
+    try {
+      const requestPayload = {
+        runs: Number(payload.runs ?? 0) || 0,
+        discovered: Number(payload.discovered ?? 0) || 0,
+      };
+      if (payload.reason) {
+        requestPayload.reason = payload.reason;
+      }
+      if (payload.error) {
+        requestPayload.error = true;
+      }
+      if (payload.message) {
+        requestPayload.message = payload.message;
+      }
+      await notifyDiscoveryLoopComplete(requestPayload);
+      this.discoveryLoopCompletionPayload = null;
+      this.discoveryLoopCompletionSent = true;
+    } catch (error) {
+      console.warn('Failed to notify discovery loop completion', error);
+      setTimeout(() => this.tryFinalizeDiscoveryLoop(), 3000);
+    } finally {
+      this.finalizingDiscoveryLoop = false;
+    }
+  }
+
+  applyChannelUpdate(update) {
+    if (!update || !update.channelId) {
+      return;
+    }
+    const channelId = update.channelId;
+    const categories = [Category.ACTIVE, Category.ARCHIVED, Category.BLACKLISTED];
+    let shouldRender = false;
+    const mapEmails = (value) => {
+      if (!value) {
+        return null;
+      }
+      if (Array.isArray(value)) {
+        if (!value.length) {
+          return null;
+        }
+        return value.join(', ');
+      }
+      return String(value);
+    };
+    categories.forEach((category) => {
+      const table = this.tables[category];
+      if (!table || !Array.isArray(table.rows) || !table.rows.length) {
+        return;
+      }
+      const index = table.rows.findIndex((row) => row.channel_id === channelId);
+      if (index === -1) {
+        return;
+      }
+      const current = table.rows[index];
+      const nextRow = { ...current };
+      if (update.status) {
+        nextRow.status = update.status;
+      }
+      if ('statusReason' in update) {
+        nextRow.status_reason = update.statusReason || null;
+      }
+      if ('lastStatusChange' in update) {
+        nextRow.last_status_change = update.lastStatusChange || null;
+      }
+      if ('emails' in update) {
+        const mapped = mapEmails(update.emails);
+        nextRow.emails = mapped;
+      }
+      if ('subscribers' in update && update.subscribers != null) {
+        nextRow.subscribers = update.subscribers;
+      }
+      if ('language' in update && update.language != null) {
+        nextRow.language = update.language;
+      }
+      if ('languageConfidence' in update && update.languageConfidence != null) {
+        nextRow.language_confidence = update.languageConfidence;
+      }
+      if ('lastUpdated' in update && update.lastUpdated) {
+        nextRow.last_updated = update.lastUpdated;
+      }
+      if ('emailGatePresent' in update) {
+        nextRow.email_gate_present = update.emailGatePresent;
+      }
+      const nextRows = [...table.rows];
+      nextRows[index] = nextRow;
+      this.tables[category] = { ...table, rows: nextRows };
+      if (category === this.activeTab) {
+        shouldRender = true;
+      }
+    });
+    if (shouldRender) {
+      this.renderTable();
+    }
+  }
+
   async startDiscoveryLoop(initialInputs = null) {
     if (this.discoveryLoopActive) {
       this.updateStatusBar('Discovery loop is already running.', 'info');
@@ -1460,9 +1782,17 @@ class Dashboard {
     }
     this.discoveryLoopStats = { runs: 0, found: 0 };
     this.discoveryLoopStopping = false;
+    this.discoveryLoopCompletionPayload = null;
+    this.discoveryLoopCompletionSent = false;
+    this.finalizingDiscoveryLoop = false;
     this.setDiscoveryLoopRunningState(true);
     this.updateDiscoveryLoopCounter();
     this.updateStatusBar('Discovery loop started. Click stop to finish.', 'info');
+    try {
+      await notifyDiscoveryLoopStart({ runs: 0, discovered: 0 });
+    } catch (error) {
+      console.warn('Failed to notify discovery loop start', error);
+    }
 
     let loopError = false;
     try {
@@ -1481,6 +1811,7 @@ class Dashboard {
         this.discoveryLoopStats.runs += 1;
         this.discoveryLoopStats.found += Number(response?.found ?? 0);
         this.updateDiscoveryLoopCounter();
+        await this.reportDiscoveryLoopProgress();
         const totalMessage = `${label}: ${message} Total discovered: ${formatNumber(
           this.discoveryLoopStats.found,
         )}.`;
@@ -1494,6 +1825,7 @@ class Dashboard {
         }
       }
     } finally {
+      const stopRequested = this.discoveryLoopStopping;
       const finalRuns = this.discoveryLoopStats.runs;
       const finalFound = this.discoveryLoopStats.found;
       this.discoveryLoopStopping = false;
@@ -1511,10 +1843,21 @@ class Dashboard {
           this.updateStatusBar('Discovery loop stopped.', 'info');
         }
       }
+      const completionReason = loopError
+        ? 'error'
+        : stopRequested
+        ? 'stopped'
+        : 'completed';
+      this.queueDiscoveryLoopCompletion({
+        runs: finalRuns,
+        discovered: finalFound,
+        reason: completionReason,
+        error: loopError,
+      });
     }
   }
 
-  stopDiscoveryLoop() {
+  async stopDiscoveryLoop() {
     if (!this.discoveryLoopActive || this.discoveryLoopStopping) {
       return;
     }
@@ -1523,6 +1866,11 @@ class Dashboard {
       this.el.discoverStopBtn.disabled = true;
     }
     this.updateStatusBar('Stopping discovery after current run…', 'info');
+    try {
+      await notifyDiscoveryLoopStop();
+    } catch (error) {
+      console.warn('Failed to notify discovery loop stop', error);
+    }
   }
 
   setDiscoveryLoopRunningState(running) {
@@ -1638,7 +1986,9 @@ class Dashboard {
       }
       try {
         const payload = JSON.parse(event.data);
-        if (payload.type === 'progress') {
+        if (payload.type === 'channel') {
+          this.applyChannelUpdate(payload);
+        } else if (payload.type === 'progress') {
           const completed = payload.completed ?? 0;
           const pending = payload.pending ?? Math.max(0, (payload.total ?? total ?? 0) - completed);
           this.setProgress(
@@ -1679,6 +2029,7 @@ class Dashboard {
             }
             this.autoEnrichQueuedNotified = false;
             await this.processPendingAutoEnrich();
+            this.tryFinalizeDiscoveryLoop();
           }
         } else if (payload.type === 'error') {
           this.updateStatusBar(payload.message || 'Enrichment error encountered.', 'error');
