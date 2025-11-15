@@ -1548,6 +1548,26 @@ def get_channels_for_email_enrichment(limit: Optional[int]) -> List[Dict[str, An
         return [dict(row) for row in cursor.fetchall()]
 
 
+def get_channel_status_totals() -> Dict[str, int]:
+    table = CHANNEL_TABLES[ChannelCategory.ACTIVE]
+    totals: Dict[str, int] = {status: 0 for status in ("new", "processing", "completed", "error")}
+    extras: Dict[str, int] = {}
+    with get_cursor() as cursor:
+        cursor.execute(
+            f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
+        )
+        for row in cursor.fetchall():
+            status = (row["status"] or "").strip().lower()
+            count = row["count"] if row and row["count"] is not None else 0
+            if not status:
+                continue
+            if status in totals:
+                totals[status] = count
+            else:
+                extras[status] = count
+    return {**totals, **extras}
+
+
 def get_channel_totals() -> Dict[str, int]:
     totals: Dict[str, int] = {}
     with get_cursor() as cursor:

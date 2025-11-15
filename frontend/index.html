@@ -95,6 +95,12 @@
           <label class="discover-toggle"><input type="checkbox" id="enrichForceToggle" /> Force run</label>
         </div>
         <div class="status-container">
+          <div class="system-status" id="systemStatusBar" aria-live="polite">
+            <span class="system-status__item">
+              <span class="system-status__indicator system-status__indicator--idle"></span>
+              <span>Collecting system status…</span>
+            </span>
+          </div>
           <div class="status-bar" id="statusBar" hidden></div>
           <div class="status-bar status-bar--info" id="progressBar" hidden></div>
           <div class="status-bar" id="summaryBar" hidden></div>

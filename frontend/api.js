@@ -137,6 +137,34 @@ export async function fetchStats() {
   return request('/api/stats');
 }
 
+export async function notifyDiscoveryLoopStart(state = {}) {
+  return request('/api/discovery/loop/start', {
+    method: 'POST',
+    body: JSON.stringify(state),
+  });
+}
+
+export async function notifyDiscoveryLoopProgress(state = {}) {
+  return request('/api/discovery/loop/progress', {
+    method: 'POST',
+    body: JSON.stringify(state),
+  });
+}
+
+export async function notifyDiscoveryLoopStop() {
+  return request('/api/discovery/loop/stop', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function notifyDiscoveryLoopComplete(state = {}) {
+  return request('/api/discovery/loop/complete', {
+    method: 'POST',
+    body: JSON.stringify(state),
+  });
+}
+
 export async function downloadCsv(category, filters, sort, order, options = {}) {
   const query = buildQuery(filters, category, sort, order, 10000, 0);
   const params = new URLSearchParams(query);

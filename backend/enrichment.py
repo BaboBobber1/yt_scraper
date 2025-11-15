@@ -9,7 +9,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import database
 from .youtube import EnrichmentError, enrich_channel, enrich_channel_email_only
@@ -181,6 +181,21 @@ class EnrichmentManager:
                     self._jobs.pop(job_id, None)
 
         return event_stream()
+
+    def get_job_summaries(self) -> Dict[str, Any]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        summaries = []
+        pending_total = 0
+        for job in jobs:
+            summary = job.summary()
+            pending_total += int(summary.get("pending", 0) or 0)
+            summaries.append(summary)
+        return {
+            "activeJobs": len(summaries),
+            "pendingChannels": pending_total,
+            "jobs": summaries,
+        }
 
     def _process_channel(self, job: EnrichmentJob, channel: Dict) -> None:
         if job.mode == "email_only":

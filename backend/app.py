@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from . import database
 from .database import ChannelCategory, ChannelFilters, ensure_channel_url
 from .enrichment import manager
+from .state import discovery_state
 from .youtube import (
     ChannelResolution,
     DiscoveryMetadata,
@@ -111,6 +112,14 @@ def _parse_optional_int(value: Any) -> Optional[int]:
             return int(float(candidate))
         except ValueError:
             return None
+
+
+def _coerce_non_negative_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
 
 
 def _collect_filters(
@@ -336,6 +345,56 @@ def api_discover(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
         response_payload["blacklisted"] = blacklisted_candidates
 
     return JSONResponse(response_payload)
+
+
+@app.post("/api/discovery/loop/start")
+def api_discovery_loop_start(
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> JSONResponse:
+    data = payload or {}
+    runs = _coerce_non_negative_int(data.get("runs"))
+    discovered = _coerce_non_negative_int(data.get("discovered"))
+    state = discovery_state.mark_started(runs=runs, discovered=discovered)
+    return JSONResponse(state)
+
+
+@app.post("/api/discovery/loop/progress")
+def api_discovery_loop_progress(
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> JSONResponse:
+    data = payload or {}
+    runs = _coerce_non_negative_int(data.get("runs"))
+    discovered = _coerce_non_negative_int(data.get("discovered"))
+    state = discovery_state.update_progress(runs=runs, discovered=discovered)
+    return JSONResponse(state)
+
+
+@app.post("/api/discovery/loop/stop")
+def api_discovery_loop_stop() -> JSONResponse:
+    state = discovery_state.request_stop()
+    return JSONResponse(state)
+
+
+@app.post("/api/discovery/loop/complete")
+def api_discovery_loop_complete(
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> JSONResponse:
+    data = payload or {}
+    runs = _coerce_non_negative_int(data.get("runs"))
+    discovered = _coerce_non_negative_int(data.get("discovered"))
+    reason_value = data.get("reason")
+    reason = str(reason_value).strip().lower() if isinstance(reason_value, str) else None
+    error_flag = bool(data.get("error"))
+    message_value = data.get("message")
+    message = str(message_value) if isinstance(message_value, str) else None
+    state = discovery_state.mark_completed(
+        runs=runs,
+        discovered=discovered,
+        reason=reason or None,
+        error=error_flag,
+        message=message,
+    )
+    return JSONResponse(state)
 
 
 @app.post("/api/blacklist/import")
@@ -1075,4 +1134,16 @@ async def api_import_bundle(
 @app.get("/api/stats")
 def api_stats() -> JSONResponse:
     totals = database.get_channel_totals()
-    return JSONResponse(totals)
+    status_totals = database.get_channel_status_totals()
+    loop_state = discovery_state.snapshot()
+    enrichment_state = manager.get_job_summaries()
+    enrichment_state.setdefault("activeJobs", 0)
+    enrichment_state.setdefault("pendingChannels", 0)
+    enrichment_state["processingChannels"] = status_totals.get("processing", 0)
+    payload: Dict[str, Any] = {
+        **totals,
+        "statusTotals": status_totals,
+        "discoveryLoop": loop_state,
+        "enrichment": enrichment_state,
+    }
+    return JSONResponse(payload)
