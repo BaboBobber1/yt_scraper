@@ -236,7 +236,7 @@ def test_enrich_channel_resolves_handle(monkeypatch):
 
 def test_enrich_channel_feed_unavailable(monkeypatch):
     def fake_fetch_rss(channel_id: str, timeout: int = 8):
-        raise youtube.EnrichmentError("Channel feed not available")
+        raise youtube.FeedUnavailableError("Channel feed not available")
 
     def fake_about(channel: Dict[str, Any], timeout: int = 5):
         assert channel["channel_id"] == "UC1234567890123456789012"

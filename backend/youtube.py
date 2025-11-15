@@ -33,6 +33,11 @@ SESSION.headers.update(
         "Accept-Language": "en-US,en;q=0.9",
     }
 )
+# Bypass the EU consent interstitial which removes required JSON blobs from
+# YouTube HTML responses. These values mirror the cookies a consenting user
+# would have after accepting the prompt in a browser session.
+SESSION.cookies.set("CONSENT", "YES+cb.20240220-08-p0.en+FX+123")
+SESSION.cookies.set("SOCS", "CAI")
 
 CHANNEL_ID_PATTERN = re.compile(r"(UC[\w-]{22})", re.IGNORECASE)
 HYPERLINK_RE = re.compile(r"=HYPERLINK\(\s*([\"'])([^\"']+?)\1", re.IGNORECASE)
@@ -271,6 +276,10 @@ MEDIA_NS = "{http://search.yahoo.com/mrss/}"
 
 class EnrichmentError(RuntimeError):
     """Raised when enrichment of a channel fails due to data issues."""
+
+
+class FeedUnavailableError(EnrichmentError):
+    """Raised when a channel's feed is permanently unavailable."""
 
 
 
@@ -677,10 +686,14 @@ def _fetch_rss(channel_id: str, timeout: int = 8) -> Tuple[str, Optional[str], D
     if response.status_code in {404, 410}:
         try:
             return _fetch_uploads_playlist(channel_id, timeout=timeout)
+        except FeedUnavailableError as exc:
+            raise FeedUnavailableError(
+                f"Channel feed not available (feed HTTP {response.status_code}; {exc})"
+            ) from exc
         except EnrichmentError as exc:
             raise EnrichmentError(
-                f"Channel feed not available (feed HTTP {response.status_code}; {exc})"
-            )
+                f"Failed to parse uploads playlist after feed HTTP {response.status_code}: {exc}"
+            ) from exc
     response.raise_for_status()
 
     try:
@@ -714,6 +727,14 @@ def _fetch_rss(channel_id: str, timeout: int = 8) -> Tuple[str, Optional[str], D
     }
 
 
+def get_channel_feed(
+    channel_id: str, *, timeout: int = 8
+) -> Tuple[str, Optional[str], Dict[str, Optional[str]]]:
+    """Public helper returning the latest uploads feed for a channel."""
+
+    return _fetch_rss(channel_id, timeout=timeout)
+
+
 def _coerce_runs_text(node: Any) -> str:
     if isinstance(node, str):
         return node
@@ -733,27 +754,43 @@ def _coerce_runs_text(node: Any) -> str:
     return ""
 
 
+def get_channel_uploads_playlist_id(channel_id: str) -> str:
+    """Return the uploads playlist ID for a given YouTube channel ID."""
+
+    if not channel_id:
+        raise EnrichmentError("Channel feed not available")
+    candidate = channel_id.strip().upper()
+    if len(candidate) != 24 or not candidate.startswith("UC"):
+        raise EnrichmentError("Channel feed not available")
+    return f"UU{candidate[2:]}"
+
+
 def _fetch_uploads_playlist(
     channel_id: str, timeout: int = 8
 ) -> Tuple[str, Optional[str], Dict[str, Optional[str]]]:
-    if not channel_id or len(channel_id) != 24 or not channel_id.upper().startswith("UC"):
-        raise EnrichmentError("Channel feed not available")
-
-    playlist_id = f"UU{channel_id[2:]}"
+    playlist_id = get_channel_uploads_playlist_id(channel_id)
     RATE_LIMITER.wait()
     try:
         response = SESSION.get(
             UPLOADS_PLAYLIST_TEMPLATE.format(playlist_id=playlist_id),
+            params={
+                "hl": "en",
+                "gl": "US",
+                "persist_gl": 1,
+                "persist_hl": 1,
+            },
             timeout=timeout,
         )
     except requests.RequestException as exc:  # pragma: no cover - network artifact
         raise EnrichmentError(f"uploads playlist request failed: {exc}")
-    if response.status_code == 404:
-        raise EnrichmentError("uploads playlist returned HTTP 404")
+    if response.status_code in {404, 410}:
+        raise FeedUnavailableError(f"uploads playlist returned HTTP {response.status_code}")
     response.raise_for_status()
 
     html_text = response.text
     data = _extract_json_blob(html_text, "ytInitialData")
+    if not isinstance(data, dict):
+        data = _extract_ytinitialdata(html_text)
     if not isinstance(data, dict):
         raise EnrichmentError("uploads playlist missing ytInitialData")
 
@@ -797,6 +834,8 @@ def _extract_json_blob(html_text: str, marker: str) -> Optional[Dict]:
     assignment_patterns = [
         rf"{marker}\s*=\s*",
         rf"var\s+{marker}\s*=\s*",
+        rf"let\s+{marker}\s*=\s*",
+        rf"const\s+{marker}\s*=\s*",
         rf"window\.{marker}\s*=\s*",
         rf"window\[\"{marker}\"\]\s*=\s*",
     ]
@@ -984,10 +1023,12 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
     status_reason: Optional[str] = None
 
     try:
-        feed_title, feed_description, video = _fetch_rss(channel_id)
-    except EnrichmentError as exc:
+        feed_title, feed_description, video = get_channel_feed(channel_id)
+    except FeedUnavailableError as exc:
         status = "feed_unavailable"
         status_reason = str(exc)
+    except EnrichmentError:
+        raise
     except requests.RequestException as exc:  # pragma: no cover - network errors
         raise EnrichmentError(f"Failed to load channel feed: {exc}")
 
@@ -1085,7 +1126,9 @@ def _fetch_about_emails(
 
 def _fetch_latest_video_metadata(channel_id: str) -> Optional[Dict[str, Optional[str]]]:
     try:
-        _, feed_description, video = _fetch_rss(channel_id, timeout=5)
+        _, feed_description, video = get_channel_feed(channel_id, timeout=5)
+    except FeedUnavailableError:
+        return None
     except EnrichmentError:
         return None
     except requests.RequestException as exc:  # pragma: no cover - network errors
