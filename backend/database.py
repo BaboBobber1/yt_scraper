@@ -59,6 +59,8 @@ CHANNEL_TABLES = {
     ChannelCategory.BLACKLISTED: "channels_blacklisted",
 }
 
+RECENT_NO_EMAIL_STATUS = "skipped_no_email_recently"
+
 
 @dataclass(frozen=True)
 class DiscoveryKeywordState:
@@ -1817,12 +1819,26 @@ def blacklist_channels_by_ids(
     return blacklisted
 
 
-def get_pending_channels(limit: Optional[int]) -> List[Dict[str, Any]]:
-    limit_clause = "LIMIT ?" if limit is not None else ""
-    params: Tuple[Any, ...] = (limit,) if limit is not None else tuple()
+def get_pending_channels(limit: Optional[int], *, offset: int = 0) -> List[Dict[str, Any]]:
+    offset = max(0, int(offset))
+    if limit is not None and limit <= 0:
+        return []
+
+    if limit is None and offset <= 0:
+        limit_clause = ""
+        params: Tuple[Any, ...] = tuple()
+    elif limit is None:
+        limit_clause = "LIMIT -1 OFFSET ?"
+        params = (offset,)
+    elif offset <= 0:
+        limit_clause = "LIMIT ?"
+        params = (limit,)
+    else:
+        limit_clause = "LIMIT ? OFFSET ?"
+        params = (limit, offset)
     table = CHANNEL_TABLES[ChannelCategory.ACTIVE]
     query = (
-        f"SELECT * FROM {table} WHERE status IN ('new', 'error') "
+        f"SELECT * FROM {table} WHERE status IN ('new', 'error', '{RECENT_NO_EMAIL_STATUS}') "
         f"ORDER BY last_attempted IS NULL DESC, last_attempted ASC "
         + limit_clause
     )
