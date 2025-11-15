@@ -259,6 +259,7 @@ class RateLimiter:
 RATE_LIMITER = RateLimiter(min_interval=0.35)  # ~3 requests per second globally
 
 RSS_TEMPLATE = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+UPLOADS_PLAYLIST_TEMPLATE = "https://www.youtube.com/playlist?list={playlist_id}"
 
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
 MEDIA_NS = "{http://search.yahoo.com/mrss/}"
@@ -669,8 +670,11 @@ def extract_emails(texts: Iterable[str]) -> List[str]:
 def _fetch_rss(channel_id: str, timeout: int = 8) -> Tuple[str, Optional[str], Dict[str, Optional[str]]]:
     RATE_LIMITER.wait()
     response = SESSION.get(RSS_TEMPLATE.format(channel_id=channel_id), timeout=timeout)
-    if response.status_code == 404:
-        raise EnrichmentError("Channel feed not available")
+    if response.status_code in {404, 410}:
+        try:
+            return _fetch_uploads_playlist(channel_id, timeout=timeout)
+        except EnrichmentError:
+            raise EnrichmentError("Channel feed not available")
     response.raise_for_status()
 
     try:
@@ -702,6 +706,80 @@ def _fetch_rss(channel_id: str, timeout: int = 8) -> Tuple[str, Optional[str], D
         "description": video_description.strip(),
         "timestamp": updated or published,
     }
+
+
+def _coerce_runs_text(node: Any) -> str:
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict):
+        if "simpleText" in node:
+            return str(node["simpleText"])
+        runs = node.get("runs")
+        if isinstance(runs, list):
+            parts: List[str] = []
+            for run in runs:
+                if isinstance(run, dict):
+                    text = run.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                return "".join(parts)
+    return ""
+
+
+def _fetch_uploads_playlist(
+    channel_id: str, timeout: int = 8
+) -> Tuple[str, Optional[str], Dict[str, Optional[str]]]:
+    if not channel_id or len(channel_id) != 24 or not channel_id.upper().startswith("UC"):
+        raise EnrichmentError("Channel feed not available")
+
+    playlist_id = f"UU{channel_id[2:]}"
+    RATE_LIMITER.wait()
+    response = SESSION.get(
+        UPLOADS_PLAYLIST_TEMPLATE.format(playlist_id=playlist_id),
+        timeout=timeout,
+    )
+    if response.status_code == 404:
+        raise EnrichmentError("Channel feed not available")
+    response.raise_for_status()
+
+    html_text = response.text
+    data = _extract_json_blob(html_text, "ytInitialData")
+    if not isinstance(data, dict):
+        raise EnrichmentError("Channel feed not available")
+
+    metadata = data.get("metadata", {})
+    if isinstance(metadata, dict):
+        playlist_meta = metadata.get("playlistMetadataRenderer", {})
+    else:
+        playlist_meta = {}
+    if isinstance(playlist_meta, dict):
+        title = playlist_meta.get("title", "")
+    else:
+        title = ""
+
+    video_renderer = _find_first(data, "playlistVideoRenderer")
+    if not isinstance(video_renderer, dict):
+        raise EnrichmentError("Channel feed not available")
+
+    video_id = video_renderer.get("videoId")
+    if not isinstance(video_id, str) or not video_id:
+        raise EnrichmentError("Channel feed not available")
+
+    video_title = _coerce_runs_text(video_renderer.get("title"))
+    description_text = _coerce_runs_text(video_renderer.get("descriptionSnippet")) or None
+    published_text = _coerce_runs_text(video_renderer.get("publishedTimeText")) or None
+
+    return (
+        str(title) if title else "",
+        description_text,
+        {
+            "video_id": video_id,
+            "title": video_title.strip(),
+            "description": (description_text or "").strip(),
+            "timestamp": published_text,
+        },
+    )
 
 
 def _extract_json_blob(html_text: str, marker: str) -> Optional[Dict]:
