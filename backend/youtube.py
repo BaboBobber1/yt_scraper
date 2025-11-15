@@ -12,8 +12,12 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
+import logging
+
 import requests
 from langdetect import DetectorFactory, LangDetectException, detect_langs
+
+LOGGER = logging.getLogger(__name__)
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -673,8 +677,10 @@ def _fetch_rss(channel_id: str, timeout: int = 8) -> Tuple[str, Optional[str], D
     if response.status_code in {404, 410}:
         try:
             return _fetch_uploads_playlist(channel_id, timeout=timeout)
-        except EnrichmentError:
-            raise EnrichmentError("Channel feed not available")
+        except EnrichmentError as exc:
+            raise EnrichmentError(
+                f"Channel feed not available (feed HTTP {response.status_code}; {exc})"
+            )
     response.raise_for_status()
 
     try:
@@ -735,18 +741,21 @@ def _fetch_uploads_playlist(
 
     playlist_id = f"UU{channel_id[2:]}"
     RATE_LIMITER.wait()
-    response = SESSION.get(
-        UPLOADS_PLAYLIST_TEMPLATE.format(playlist_id=playlist_id),
-        timeout=timeout,
-    )
+    try:
+        response = SESSION.get(
+            UPLOADS_PLAYLIST_TEMPLATE.format(playlist_id=playlist_id),
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:  # pragma: no cover - network artifact
+        raise EnrichmentError(f"uploads playlist request failed: {exc}")
     if response.status_code == 404:
-        raise EnrichmentError("Channel feed not available")
+        raise EnrichmentError("uploads playlist returned HTTP 404")
     response.raise_for_status()
 
     html_text = response.text
     data = _extract_json_blob(html_text, "ytInitialData")
     if not isinstance(data, dict):
-        raise EnrichmentError("Channel feed not available")
+        raise EnrichmentError("uploads playlist missing ytInitialData")
 
     metadata = data.get("metadata", {})
     if isinstance(metadata, dict):
@@ -760,11 +769,11 @@ def _fetch_uploads_playlist(
 
     video_renderer = _find_first(data, "playlistVideoRenderer")
     if not isinstance(video_renderer, dict):
-        raise EnrichmentError("Channel feed not available")
+        raise EnrichmentError("uploads playlist missing playlistVideoRenderer")
 
     video_id = video_renderer.get("videoId")
     if not isinstance(video_id, str) or not video_id:
-        raise EnrichmentError("Channel feed not available")
+        raise EnrichmentError("uploads playlist missing video id")
 
     video_title = _coerce_runs_text(video_renderer.get("title"))
     description_text = _coerce_runs_text(video_renderer.get("descriptionSnippet")) or None
@@ -783,15 +792,60 @@ def _fetch_uploads_playlist(
 
 
 def _extract_json_blob(html_text: str, marker: str) -> Optional[Dict]:
-    pattern = re.compile(rf"{marker}\s*=\s*(\{{.*?\}});", re.DOTALL)
-    match = pattern.search(html_text)
-    if not match:
+    """Extract a JSON object assigned to ``marker`` from an HTML document."""
+
+    assignment_patterns = [
+        rf"{marker}\s*=\s*",
+        rf"var\s+{marker}\s*=\s*",
+        rf"window\.{marker}\s*=\s*",
+        rf"window\[\"{marker}\"\]\s*=\s*",
+    ]
+
+    def _extract_object(text: str, start_index: int) -> Optional[str]:
+        depth = 0
+        in_string = False
+        escape = False
+        quote_char = ""
+        for index in range(start_index, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if char == "\\":
+                    escape = True
+                    continue
+                if char == quote_char:
+                    in_string = False
+                continue
+            if char in ('"', "'"):
+                in_string = True
+                quote_char = char
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start_index : index + 1]
         return None
-    json_text = match.group(1)
-    try:
-        return json.loads(json_text)
-    except json.JSONDecodeError:
-        return None
+
+    for pattern in assignment_patterns:
+        match = re.search(pattern, html_text)
+        if not match:
+            continue
+        brace_index = html_text.find("{", match.end())
+        if brace_index == -1:
+            continue
+        json_text = _extract_object(html_text, brace_index)
+        if not json_text:
+            continue
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            LOGGER.debug("Failed to parse %s JSON blob", marker, exc_info=True)
+            continue
+    return None
 
 
 def _find_first(node: object, key: str) -> Optional[Dict]:

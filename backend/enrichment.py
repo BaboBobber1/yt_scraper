@@ -11,9 +11,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import logging
+
 from . import database
 from .youtube import EnrichmentError, enrich_channel, enrich_channel_email_only
 
+
+LOGGER = logging.getLogger(__name__)
 
 NO_EMAIL_RETRY_WINDOW = dt.timedelta(days=30)
 RECENT_NO_EMAIL_STATUS = database.RECENT_NO_EMAIL_STATUS
@@ -250,6 +254,7 @@ class EnrichmentManager:
                 last_enriched_at
                 and last_result == "no_emails"
                 and not has_emails
+                and status not in {"error", "failed", "feed_unavailable", "invalid_channel"}
                 and now - last_enriched_at < cooldown
             ):
                 should_skip = True
@@ -260,6 +265,11 @@ class EnrichmentManager:
                 if skip_reason:
                     skipped_info["skip_reason"] = skip_reason
                 if skip_reason == "recent_no_email":
+                    LOGGER.info(
+                        "Skipping channel %s due to recent no-email result (last_enriched_at=%s)",
+                        channel_id,
+                        channel.get("last_enriched_at"),
+                    )
                     self._mark_recent_no_email_skip(channel_id, now_iso)
                 skipped.append(skipped_info)
                 if skip_reason == "recent_no_email":
@@ -371,6 +381,7 @@ class EnrichmentManager:
         except EnrichmentError as exc:
             error_time = dt.datetime.utcnow().isoformat()
             reason = str(exc)
+            LOGGER.info("Channel %s enrichment error: %s", channel_id, reason)
             status = "error"
             completed_flag = False
             result_value = "error"
@@ -405,6 +416,7 @@ class EnrichmentManager:
         except Exception as exc:  # Catch-all safety net
             error_time = dt.datetime.utcnow().isoformat()
             reason = f"Unexpected error: {exc}"[:500]
+            LOGGER.exception("Unexpected enrichment error for %s", channel_id)
             database.update_channel_enrichment(
                 channel_id,
                 needs_enrichment=True,
@@ -441,6 +453,12 @@ class EnrichmentManager:
         result_value = "emails_found" if enriched_emails else (
             status if status != "completed" else "no_emails"
         )
+        if status == "feed_unavailable":
+            LOGGER.info(
+                "Channel %s feed unavailable: %s",
+                channel_id,
+                status_reason or "",
+            )
         database.update_channel_enrichment(
             channel_id,
             name=enriched.get("name") or enriched.get("title") or channel.get("name") or channel.get("title"),
