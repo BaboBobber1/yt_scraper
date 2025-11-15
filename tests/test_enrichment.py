@@ -68,7 +68,7 @@ def test_recent_no_email_channel_skipped(manager, update_calls):
     enriched_time = _isoformat(now - dt.timedelta(days=1))
     channel = {
         "channel_id": "chan-skip",
-        "status": "error",
+        "status": "completed",
         "last_enriched_at": enriched_time,
         "last_enriched_result": "no_emails",
     }
@@ -84,6 +84,23 @@ def test_recent_no_email_channel_skipped(manager, update_calls):
     assert updates["status"] == enrichment.RECENT_NO_EMAIL_STATUS
     assert updates["status_reason"] == enrichment.RECENT_NO_EMAIL_REASON
     assert updates["last_attempted"] == updates["last_status_change"]
+
+
+def test_recent_no_email_not_skipped_after_error(manager, update_calls):
+    now = dt.datetime.utcnow()
+    enriched_time = _isoformat(now - dt.timedelta(hours=6))
+    channel = {
+        "channel_id": "chan-error",
+        "status": "error",
+        "last_enriched_at": enriched_time,
+        "last_enriched_result": "no_emails",
+    }
+    filtered, skipped = manager._filter_channels(
+        [channel], force_run=False, never_reenrich=False
+    )
+    assert filtered == [channel]
+    assert skipped == []
+    assert not update_calls
 
 
 def test_no_email_outside_cooldown_processed(manager, update_calls):
