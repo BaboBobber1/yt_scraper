@@ -857,13 +857,93 @@ def _fetch_watch_details(video_id: str, timeout: int = 10) -> Dict[str, Optional
     }
 
 
+def _prepare_channel_for_enrichment(
+    channel: Dict[str, Optional[str]], *, timeout: int = 8
+) -> Tuple[Dict[str, Optional[str]], ChannelResolution]:
+    """Return a channel copy with a canonical ID and related metadata."""
+
+    def _build_resolution_from_known(channel_id: str) -> ChannelResolution:
+        canonical_url = channel.get("url") or f"https://www.youtube.com/channel/{channel_id}"
+        handle_candidate = channel.get("handle") or _extract_handle_from_url(channel.get("url"))
+        normalized_handle = _normalize_handle(handle_candidate) if handle_candidate else None
+        title_candidate = channel.get("name") or channel.get("title")
+        return ChannelResolution(
+            channel_id=channel_id,
+            canonical_url=canonical_url,
+            handle=normalized_handle,
+            title=title_candidate,
+        )
+
+    direct_id = extract_channel_id(channel.get("channel_id"))
+    if direct_id:
+        resolution = _build_resolution_from_known(direct_id)
+        prepared = dict(channel)
+        prepared["channel_id"] = direct_id
+        prepared.setdefault("url", resolution.canonical_url)
+        if resolution.handle:
+            prepared.setdefault("handle", resolution.handle)
+        return prepared, resolution
+
+    url_candidate = channel.get("url")
+    if url_candidate:
+        extracted = extract_channel_id(url_candidate)
+        if extracted:
+            resolution = _build_resolution_from_known(extracted)
+            prepared = dict(channel)
+            prepared["channel_id"] = extracted
+            prepared["url"] = resolution.canonical_url
+            if resolution.handle:
+                prepared.setdefault("handle", resolution.handle)
+            return prepared, resolution
+
+    candidates: List[str] = []
+    for value in (channel.get("channel_id"), channel.get("url"), channel.get("handle")):
+        if value and value not in candidates:
+            candidates.append(value)
+
+    for candidate in candidates:
+        resolution, _ = resolve_channel(candidate, timeout=timeout)
+        if resolution:
+            prepared = dict(channel)
+            prepared["channel_id"] = resolution.channel_id
+            prepared["url"] = resolution.canonical_url
+            if resolution.handle:
+                prepared["handle"] = resolution.handle
+            if resolution.title and not prepared.get("name"):
+                prepared["name"] = resolution.title
+            return prepared, resolution
+
+    raise EnrichmentError("invalid_channel")
+
+
 def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
-    channel_id = channel.get("channel_id")
+    prepared, resolution = _prepare_channel_for_enrichment(channel)
+    channel_id = prepared.get("channel_id")
     if not channel_id:
         raise EnrichmentError("Missing channel id")
 
-    feed_title, feed_description, video = _fetch_rss(channel_id)
-    watch = _fetch_watch_details(video["video_id"])
+    feed_title = resolution.title or prepared.get("name") or prepared.get("title") or ""
+    feed_description: Optional[str] = None
+    video: Dict[str, Optional[str]] = {}
+    watch: Dict[str, Optional[str]] = {}
+    status = "completed"
+    status_reason: Optional[str] = None
+
+    try:
+        feed_title, feed_description, video = _fetch_rss(channel_id)
+    except EnrichmentError as exc:
+        status = "feed_unavailable"
+        status_reason = str(exc)
+    except requests.RequestException as exc:  # pragma: no cover - network errors
+        raise EnrichmentError(f"Failed to load channel feed: {exc}")
+
+    if video.get("video_id"):
+        try:
+            watch = _fetch_watch_details(video["video_id"])
+        except EnrichmentError:
+            watch = {}
+        except requests.RequestException as exc:  # pragma: no cover - network errors
+            raise EnrichmentError(f"Failed to load latest video: {exc}")
 
     combined_description = watch.get("description") or video.get("description") or ""
     combined_texts = [video.get("title", ""), combined_description, feed_description or ""]
@@ -872,7 +952,6 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
     emails = extract_emails([combined_description])
     if feed_description:
         emails.extend(extract_emails([feed_description]))
-    # Deduplicate again after combining feed and watch descriptions.
     unique_emails: List[str] = []
     seen = set()
     for email in emails:
@@ -885,21 +964,25 @@ def enrich_channel(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]
 
     email_gate_present: Optional[bool] = False if unique_emails else None
     if not unique_emails:
-        about_emails, gate_present = _fetch_about_emails(channel)
+        about_emails, gate_present = _fetch_about_emails(prepared)
         if about_emails:
             unique_emails = about_emails
             email_gate_present = False
         else:
             email_gate_present = gate_present
 
+    last_updated = watch.get("upload_date") or video.get("timestamp")
+
     return {
-        "name": feed_title or channel.get("name") or channel.get("title"),
+        "name": feed_title or prepared.get("name") or prepared.get("title"),
         "subscribers": watch.get("subscribers"),
         "language": lang_result["language"] if lang_result else (watch.get("language") or None),
         "language_confidence": lang_result["confidence"] if lang_result else None,
         "emails": unique_emails,
-        "last_updated": watch.get("upload_date") or video.get("timestamp"),
+        "last_updated": last_updated,
         "email_gate_present": email_gate_present,
+        "status": status,
+        "status_reason": status_reason,
     }
 
 
@@ -971,13 +1054,14 @@ def _fetch_latest_video_metadata(channel_id: str) -> Optional[Dict[str, Optional
 
 
 def enrich_channel_email_only(channel: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
-    channel_id = channel.get("channel_id")
+    prepared, _ = _prepare_channel_for_enrichment(channel)
+    channel_id = prepared.get("channel_id")
     if not channel_id:
         raise EnrichmentError("Missing channel id")
 
     emails: List[str] = []
 
-    about_emails, about_gate = _fetch_about_emails(channel)
+    about_emails, about_gate = _fetch_about_emails(prepared)
     email_gate_present: Optional[bool] = about_gate
     if about_emails:
         emails.extend(about_emails)

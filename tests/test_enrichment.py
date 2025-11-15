@@ -105,3 +105,73 @@ def test_no_email_outside_cooldown_processed(manager, update_calls):
     assert channel_id == "chan-retry"
     assert updates["status"] == "new"
     assert updates["status_reason"] is None
+
+
+def test_process_channel_feed_unavailable(monkeypatch):
+    job = enrichment.EnrichmentJob(job_id="job", channels=[{"channel_id": "UC1"}])
+    channel = {"channel_id": "UC1", "status": "new"}
+    updates = []
+
+    def fake_set_status(channel_id, status, reason, timestamp):
+        updates.append(("set_status", channel_id, status, reason, timestamp))
+
+    def fake_update(channel_id, **fields):
+        updates.append(("update", channel_id, fields))
+
+    def fake_record_emails(channel_id, emails, timestamp):
+        updates.append(("record_emails", channel_id, emails, timestamp))
+
+    monkeypatch.setattr(enrichment.database, "set_channel_status", fake_set_status)
+    monkeypatch.setattr(enrichment.database, "update_channel_enrichment", fake_update)
+    monkeypatch.setattr(enrichment.database, "record_channel_emails", fake_record_emails)
+    monkeypatch.setattr(
+        enrichment,
+        "enrich_channel",
+        lambda channel: {
+            "name": "Example",
+            "emails": ["feed@example.com"],
+            "email_gate_present": False,
+            "status": "feed_unavailable",
+            "status_reason": "Channel feed not available",
+        },
+    )
+
+    manager = enrichment.EnrichmentManager()
+    manager._process_channel_full(job, channel)
+
+    # Expect status update during processing and final enrichment update.
+    assert any(entry[0] == "update" for entry in updates)
+    final_update = [entry for entry in updates if entry[0] == "update"][-1]
+    fields = final_update[2]
+    assert fields["status"] == "feed_unavailable"
+    assert fields["status_reason"] == "Channel feed not available"
+    assert fields["last_enriched_result"] == "emails_found"
+    assert job.completed == 1
+    assert job.errors == 0
+
+
+def test_process_channel_invalid_reference(monkeypatch):
+    job = enrichment.EnrichmentJob(job_id="job", channels=[{"channel_id": "bad"}])
+    channel = {"channel_id": "bad", "status": "new"}
+    updates = []
+
+    def fake_set_status(channel_id, status, reason, timestamp):
+        updates.append(("set_status", channel_id, status, reason, timestamp))
+
+    def fake_update(channel_id, **fields):
+        updates.append(("update", channel_id, fields))
+
+    monkeypatch.setattr(enrichment.database, "set_channel_status", fake_set_status)
+    monkeypatch.setattr(enrichment.database, "update_channel_enrichment", fake_update)
+    monkeypatch.setattr(enrichment, "enrich_channel", lambda channel: (_ for _ in ()).throw(enrichment.EnrichmentError("invalid_channel")))
+
+    manager = enrichment.EnrichmentManager()
+    manager._process_channel_full(job, channel)
+
+    error_update = [entry for entry in updates if entry[0] == "update"][-1]
+    fields = error_update[2]
+    assert fields["status"] == "invalid_channel"
+    assert fields["status_reason"] == "invalid_channel"
+    assert fields["last_enriched_result"] == "invalid_channel"
+    assert job.completed == 1
+    assert job.errors == 0
